@@ -27,6 +27,12 @@ pub struct PieceState {
     pub status: PieceStatus,
     pub attempts: u32,
     pub bytes: u64,
+    /// spec §5：限流不计片的重试预算 —— 连续限流次数独立记账（出现非限流
+    /// 失败即复位；rerun 认领时清零，同预算 rebill），超
+    /// SchedulerConfig::max_rate_limits 才放弃。serde(default)：
+    /// 旧 state.json 无此字段仍可加载。
+    #[serde(default)]
+    pub rate_limits: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<ChainState>,
 }
@@ -56,6 +62,7 @@ impl State {
                 status: PieceStatus::Pending,
                 attempts: 0,
                 bytes: 0,
+                rate_limits: 0,
                 chain: match p {
                     Piece::Chain { .. } => Some(ChainState { depth_done: 0, step: plan.initial_step, no_shallow: false }),
                     Piece::TagBatch { .. } => None,
@@ -122,6 +129,7 @@ pub fn reconcile(plan: &Plan, main: &Path) -> State {
                 status: if done { PieceStatus::Done } else { PieceStatus::Pending },
                 attempts: 0,
                 bytes: 0,
+                rate_limits: 0,
                 chain: if done {
                     None
                 } else {
@@ -174,5 +182,22 @@ mod tests {
     fn load_missing_returns_none() {
         let td = tempfile::tempdir().unwrap();
         assert!(State::load(td.path()).unwrap().is_none());
+    }
+
+    /// Task 13：rate_limits 是新增字段 —— 旧版 state.json（无此字段）必须仍可
+    /// 加载（serde(default)），升级 rgc 后首次 resume 不得反序列化失败。
+    #[test]
+    fn load_legacy_state_without_rate_limits() {
+        let td = tempfile::tempdir().unwrap();
+        let plan = sample_plan();
+        let legacy = format!(
+            r#"{{"fingerprint":"{}","pieces":[{{"id":"chain:refs/heads/main","status":"Pending","attempts":2,"bytes":10}}]}}"#,
+            plan.fingerprint()
+        );
+        std::fs::create_dir_all(td.path().join(".rgc")).unwrap();
+        std::fs::write(td.path().join(".rgc/state.json"), legacy).unwrap();
+        let st = State::load(td.path()).unwrap().unwrap();
+        assert_eq!(st.pieces[0].attempts, 2);
+        assert_eq!(st.pieces[0].rate_limits, 0, "missing rate_limits must default to 0");
     }
 }

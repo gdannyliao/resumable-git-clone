@@ -18,17 +18,49 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+// —— 测试缝隙（附录 A.14 / Task 12 审查 I2）——
+/// 包装每次真实 fetch：参数是"本步真实 fetch"闭包，默认直通调用。
+/// 测试注入：(a) 失败 N 次后调 real()；(b) 恒返回错误；(c) 返回 Ok 但不调
+/// real()（假成功 → 零推进停滞）。无 trait 层级，仅一个配置字段。
+pub type FetchHook = Arc<dyn Fn(&dyn Fn() -> Result<()>) -> Result<()> + Send + Sync>;
+/// 退避/冷却休眠缝隙：默认真实 thread::sleep；测试注入 no-op 使退避瞬时。
+pub type SleepHook = Arc<dyn Fn(u64) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct SchedulerConfig {
     pub max_attempts: u32,
+    /// spec §5：限流不计片的重试预算 —— 独立护栏：连续限流超过此上限
+    /// （未出现非限流失败即"连续"）才放弃，防 429 风暴死循环。
+    pub max_rate_limits: u32,
     pub target_secs: f64,
     /// 全局冷却时刻：限流/拥塞后，后续片一律推迟到此之后（spec §4.4）
     pub cooldown: Arc<Mutex<Instant>>,
+    /// 测试缝隙：包装每次真实 fetch（默认直通，见 [`FetchHook`]）
+    pub fetch: FetchHook,
+    /// 测试缝隙：退避/冷却休眠（默认真实 sleep，见 [`SleepHook`]）
+    pub sleep: SleepHook,
 }
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        // spec §5：默认 5 次
-        Self { max_attempts: 5, target_secs: 600.0, cooldown: Arc::new(Mutex::new(Instant::now())) }
+        // spec §5：默认 5 次；限流独立上限取宽裕的 10 次
+        Self {
+            max_attempts: 5,
+            max_rate_limits: 10,
+            target_secs: 600.0,
+            cooldown: Arc::new(Mutex::new(Instant::now())),
+            fetch: Arc::new(|real: &dyn Fn() -> Result<()>| real()),
+            sleep: Arc::new(|secs: u64| std::thread::sleep(Duration::from_secs(secs))),
+        }
+    }
+}
+impl std::fmt::Debug for SchedulerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // fetch/sleep 是函数指针，无 Debug —— 手动实现保住结构体可诊断性
+        f.debug_struct("SchedulerConfig")
+            .field("max_attempts", &self.max_attempts)
+            .field("max_rate_limits", &self.max_rate_limits)
+            .field("target_secs", &self.target_secs)
+            .finish_non_exhaustive()
     }
 }
 
@@ -83,7 +115,7 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
         }
     }
     st.save(main)?;
-    worker(plan, main, &mut st, cfg)?;
+    let failures = worker(plan, main, &mut st, cfg)?;
     let failed: Vec<String> = st
         .pieces
         .iter()
@@ -91,25 +123,30 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
         .map(|p| p.id.clone())
         .collect();
     if !failed.is_empty() {
-        bail!("pieces failed permanently: {:?} — rerun to resume", failed);
+        // 逐片带上最后错误：调用方不必翻 stderr 就能看到失败原因
+        // （限流风暴 → "rate-limited too many times"，停滞 → "zero-progress" 等）
+        bail!("pieces failed permanently: {:?} — rerun to resume. {}", failed, failures.join(" | "));
     }
     Ok(())
 }
 
 /// 串行工作循环：认领 → 执行 → 记账，直至无 Pending 片。
 /// 单片失败不中止整个 run（否则"最后统一列出失败片"就是死代码）：
-/// GiveUp 片落终态 Failed，run 结束时统一报告；rerun 由 run() 折返重试。
-fn worker(plan: &Plan, main: &Path, st: &mut State, cfg: &SchedulerConfig) -> Result<()> {
+/// GiveUp 片落终态 Failed，返回逐片失败明细（id + 最后错误），run 结束统一报告；
+/// rerun 由 run() 折返重试。
+fn worker(plan: &Plan, main: &Path, st: &mut State, cfg: &SchedulerConfig) -> Result<Vec<String>> {
+    let mut failures: Vec<String> = Vec::new();
     loop {
-        // 全局冷却：限流/拥塞后，后续片一律推迟（spec §4.4）
-        let wait = cfg.cooldown.lock().unwrap().saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
-            eprintln!("rgc: global cooldown, sleeping {:?} before next piece", wait);
-            std::thread::sleep(wait);
-        }
         let Some(idx) = st.pieces.iter().position(|p| p.status == PieceStatus::Pending) else {
             break;
         };
+        // 全局冷却：限流/拥塞后，后续片一律推迟（spec §4.4）。
+        // 先找活再等：无片可认领时耗完冷却毫无意义（终局前白睡 60s）。
+        let wait = cfg.cooldown.lock().unwrap().saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            eprintln!("rgc: global cooldown, sleeping {:?} before next piece", wait);
+            (cfg.sleep)(wait.as_secs());
+        }
         // write-ahead 认领：Running 先落盘再执行；保存失败绝不带伤执行。
         // C2：认领时给耗尽预算的片重新计费 —— attempts 只约束单次 run 内的重试，
         // rerun 给每个片全新预算。（旧位置在 run_piece 里判 `status == Pending`，
@@ -117,14 +154,18 @@ fn worker(plan: &Plan, main: &Path, st: &mut State, cfg: &SchedulerConfig) -> Re
         if st.pieces[idx].attempts > cfg.max_attempts {
             st.pieces[idx].attempts = 0;
         }
+        // 限流计数同预算哲学：rerun 认领时清零，风暴后的重跑以全新配额出发
+        //（否则上轮积累到顶的 rate_limits 会让 rerun 一次 429 就立刻放弃）
+        st.pieces[idx].rate_limits = 0;
         st.pieces[idx].status = PieceStatus::Running;
         st.save(main)?;
         let id = st.pieces[idx].id.clone();
         if let Err(e) = execute_piece(plan, main, st, idx, cfg) {
             eprintln!("rgc: piece {} failed this run: {e:#}", id);
+            failures.push(format!("{}: {e:#}", id));
         }
     }
-    Ok(())
+    Ok(failures)
 }
 
 fn execute_piece(plan: &Plan, main: &Path, st: &mut State, idx: usize, cfg: &SchedulerConfig) -> Result<()> {
@@ -144,17 +185,14 @@ fn execute_piece(plan: &Plan, main: &Path, st: &mut State, idx: usize, cfg: &Sch
     let res = run_piece(&piece, plan, main, &piece_path, &mut ps, cfg);
     st.pieces[idx] = ps;
     st.save(main)?;
-    // 全局降速：限流/拥塞 → 后续片冷却 60s（spec §4.4）
-    if let Err(e) = &res {
-        if matches!(kind_of(e), FailureKind::RateLimited | FailureKind::Congestion) {
-            *cfg.cooldown.lock().unwrap() = Instant::now() + Duration::from_secs(60);
-        }
-    }
+    // 全局冷却布防在 run_piece 内逐次进行（限流/拥塞的每次出现，spec §4.4）
     res
 }
 
 /// 片执行 + 重试循环。错误计预算（attempts++），按 decide 分诊：
 /// GiveUp 落终态 Failed（片已定局：本轮不再碰它，rerun 由 run() 折返重试）。
+/// spec §5 例外：429/限流/滥用检测不计入片的重试次数 —— attempts 原地踏步，
+/// 连续限流次数独立记账（非限流失败即复位），超过 max_rate_limits 才放弃。
 fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mut PieceState, cfg: &SchedulerConfig) -> Result<()> {
     loop {
         let res = match piece {
@@ -165,7 +203,7 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
                     .unwrap_or(ChainState { depth_done: 0, step: plan.initial_step, no_shallow: false });
                 run_chain(piece, plan, main, ps, chain, cfg)
             }
-            Piece::TagBatch { tags } => run_tags(plan, main, piece_path, tags, ps),
+            Piece::TagBatch { tags } => run_tags(plan, main, piece_path, tags, ps, cfg),
         };
         match res {
             Ok(()) => {
@@ -173,29 +211,61 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
                 return Ok(());
             }
             Err(e) => {
-                ps.attempts += 1;
-                match decide(ps.attempts, kind_of(&e), cfg.max_attempts) {
-                    Action::GiveUp => {
-                        // C1：终态 Failed —— 认领只挑 Pending，工作循环不再
-                        // 重认领本片（修复前折回 Pending → 无限重认领热循环，
-                        // run() 永不返回）；run 结束统一报告，rerun 折返重试。
+                let kind = kind_of(&e);
+                // 全局降速：限流/拥塞的每一次出现都布防冷却（spec §4.4）——
+                // 即便片随后重试成功，后续片也应推迟（原逻辑只看片终态，
+                // 会漏布防"中间限流但最终成功"的情形）。
+                if matches!(kind, FailureKind::RateLimited | FailureKind::Congestion) {
+                    *cfg.cooldown.lock().unwrap() = Instant::now() + Duration::from_secs(60);
+                }
+                if kind == FailureKind::RateLimited {
+                    ps.rate_limits += 1;
+                    if ps.rate_limits > cfg.max_rate_limits {
+                        // 不计预算 ≠ 无限重试：429 风暴到此为止
                         ps.status = PieceStatus::Failed;
-                        return Err(e);
+                        return Err(anyhow::anyhow!(
+                            "piece {} rate-limited too many times ({} consecutive 429/abuse responses, cap {}) — giving up this run",
+                            ps.id,
+                            ps.rate_limits,
+                            cfg.max_rate_limits
+                        ));
                     }
-                    Action::RetryNoShallow => {
-                        if let Some(c) = &mut ps.chain {
-                            c.no_shallow = true;
-                            c.depth_done = 0;
+                    match decide(ps.attempts, kind, cfg.max_attempts) {
+                        // attempts 未动 → 这里的 GiveUp 只在预算已被其他失败
+                        // 耗尽的边界触发（限流不会把片推入 GiveUp）
+                        Action::GiveUp => {
+                            ps.status = PieceStatus::Failed;
+                            return Err(e);
                         }
-                        eprintln!("rgc: shallow unsupported on {} — falling back to full fetch", ps.id);
+                        Action::RetryAfter(secs) => (cfg.sleep)(secs),
+                        _ => {} // 限流的决策只会是长退避/放弃，防御性 no-op
                     }
-                    Action::HalveAndRetry => {
-                        if let Some(c) = &mut ps.chain {
-                            c.step = halve_step(c.step);
+                } else {
+                    ps.attempts += 1;
+                    ps.rate_limits = 0; // "连续"限流：非限流失败打断计数
+                    match decide(ps.attempts, kind, cfg.max_attempts) {
+                        Action::GiveUp => {
+                            // C1：终态 Failed —— 认领只挑 Pending，工作循环不再
+                            // 重认领本片（修复前折回 Pending → 无限重认领热循环，
+                            // run() 永不返回）；run 结束统一报告，rerun 折返重试。
+                            ps.status = PieceStatus::Failed;
+                            return Err(e);
                         }
-                        std::thread::sleep(Duration::from_secs(backoff_secs(ps.attempts)));
+                        Action::RetryNoShallow => {
+                            if let Some(c) = &mut ps.chain {
+                                c.no_shallow = true;
+                                c.depth_done = 0;
+                            }
+                            eprintln!("rgc: shallow unsupported on {} — falling back to full fetch", ps.id);
+                        }
+                        Action::HalveAndRetry => {
+                            if let Some(c) = &mut ps.chain {
+                                c.step = halve_step(c.step);
+                            }
+                            (cfg.sleep)(backoff_secs(ps.attempts));
+                        }
+                        Action::RetryAfter(secs) => (cfg.sleep)(secs),
                     }
-                    Action::RetryAfter(secs) => std::thread::sleep(Duration::from_secs(secs)),
                 }
             }
         }
@@ -232,7 +302,9 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
         // TODO(A.10a): 远端在克隆中途删分支 → "couldn't find remote ref" 目前分类
         // 为 Fatal → GiveUp → 整个 clone 失败。按计划实现；重查 ls-remote 后标记
         // skipped 而非 failed 的分诊留给 Task 13/复审决定（附录 A.10）。
-        gitio::fetch_chain_step(&piece_path, full_ref, short, step, depth_done, chain.no_shallow)?;
+        // 测试缝隙：fetch 经 cfg.fetch 包装（默认直通；见 FetchHook）。
+        let real = || gitio::fetch_chain_step(&piece_path, full_ref, short, step, depth_done, chain.no_shallow);
+        (cfg.fetch)(&real)?;
         let secs = t0.elapsed().as_secs_f64();
         let (b1, c1) = gitio::repo_stats(&piece_path, short)?;
         depth_done = c1;
@@ -261,13 +333,15 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
 
 /// tag 批片：一次连接按钉住 OID fetch，再原子搬运进主仓库正式 refs/tags/*。
 /// tag fetch 永不加 --depth（片绝不能浅，A.6），故无需浅边界检查。
-fn run_tags(plan: &Plan, main: &Path, piece_path: &Path, tags: &[crate::refs::RefEntry], ps: &mut PieceState) -> Result<()> {
+fn run_tags(plan: &Plan, main: &Path, piece_path: &Path, tags: &[crate::refs::RefEntry], ps: &mut PieceState, cfg: &SchedulerConfig) -> Result<()> {
     gitio::ensure_piece_repo(main, piece_path, &plan.url)?;
     let (b0, _) = gitio::repo_stats(piece_path, "")?;
     // TODO(A.11): 远端漂移导致 tag 批 "not our ref" / "couldn't find remote ref"
     // 目前按分类重试/放弃处理；重查 ls-remote 后标记 skipped 的分诊同 A.10a，
     // 留给 Task 13/复审决定（附录 A.11）。
-    gitio::fetch_tag_batch(piece_path, tags)?;
+    // 测试缝隙：fetch 经 cfg.fetch 包装（默认直通；见 FetchHook）。
+    let real = || gitio::fetch_tag_batch(piece_path, tags);
+    (cfg.fetch)(&real)?;
     let (b1, _) = gitio::repo_stats(piece_path, "")?;
     ps.bytes += b1.saturating_sub(b0);
     gitio::transport_tags_to_main(main, piece_path, tags)?;
@@ -295,6 +369,11 @@ mod tests {
         assert_eq!(decide(0, FailureKind::ShallowUnsupported, 5), Action::RetryNoShallow);
         assert_eq!(decide(0, FailureKind::Fatal, 5), Action::GiveUp);
         assert_eq!(decide(6, FailureKind::Network, 5), Action::GiveUp);
+        // spec §5：限流不计片预算 —— run_piece 不增 attempts，decide 的预算
+        // GiveUp 只在预算已被其他失败耗尽的边界触发；限流风暴由
+        // SchedulerConfig::max_rate_limits 独立拦截（见 scheduler_retry 套件）
+        assert_eq!(decide(5, FailureKind::RateLimited, 5), Action::RetryAfter(240));
+        assert_eq!(decide(6, FailureKind::RateLimited, 5), Action::GiveUp);
     }
 
     /// 重试循环与步长自适应的集成行为：Network 失败第 2 次起步长减半（下限
