@@ -1,6 +1,6 @@
 pub mod equiv;
 pub mod errors;
-pub mod finalize;
+pub mod finalizer;
 pub mod gitio;
 pub mod jsonio;
 pub mod planner;

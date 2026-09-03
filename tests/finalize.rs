@@ -16,7 +16,7 @@ fn finalize_produces_standard_layout() {
     std::fs::create_dir_all(main.join(".rgc")).unwrap(); // 模拟残留状态目录
     let plan =
         rgc::planner::build_plan(url, &rgc::refs::ls_remote(url).unwrap(), &rgc::planner::PlannerConfig::default()).unwrap();
-    rgc::finalize::finalize(&plan, &main, false).unwrap();
+    rgc::finalizer::finalize(&plan, &main, false).unwrap();
     assert!(main.join("f0.txt").exists(), "worktree checked out");
     assert!(!main.join(".rgc").exists(), "state cleaned");
     let head = rgc::gitio::run_git(&["symbolic-ref", "HEAD"], Some(&main)).unwrap();
