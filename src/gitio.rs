@@ -149,6 +149,25 @@ pub fn is_shallow(repo: &Path) -> bool {
     }
 }
 
+/// 远端历史重写检测：所有浅边界必须是当前 tip 的祖先，否则 deepen 永远无法推进
+///（force-push / 历史重写后旧浅边界悬空 → 死循环）
+fn stale_shallow_boundary(piece: &Path, short: &str) -> bool {
+    if !is_shallow(piece) {
+        return false;
+    }
+    let local_ref = format!("refs/heads/{}", short);
+    let content = match std::fs::read_to_string(piece.join(".git").join("shallow")) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .any(|oid| {
+            run_git(&["merge-base", "--is-ancestor", oid.trim(), &local_ref], Some(piece)).is_err()
+        })
+}
+
 fn dir_size(p: &Path) -> u64 {
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(p) {
@@ -185,6 +204,14 @@ pub fn fetch_chain_step(piece: &Path, full_ref: &str, short: &str, step: u32, de
         return run_git(&["fetch", "--quiet", "origin", &refspec], Some(piece)).map(|_| ());
     }
     let has_local = run_git(&["rev-parse", "--verify", &format!("refs/heads/{}", short)], Some(piece)).is_ok();
+    // B2: 远端历史重写检测——旧浅边界悬空（不在当前 ref 历史中）→ deepen 永远无法推进 → 重置后 --depth 重取
+    let has_local = if stale_shallow_boundary(piece, short) {
+        let _ = run_git(&["update-ref", "-d", &format!("refs/heads/{}", short)], Some(piece));
+        let _ = std::fs::remove_file(piece.join(".git").join("shallow"));
+        false
+    } else {
+        has_local
+    };
     if has_local && is_shallow(piece) {
         let d = format!("--deepen={}", step);
         run_git(&["fetch", "--quiet", &d, "origin", &refspec], Some(piece))?;
@@ -203,6 +230,9 @@ pub fn transport_to_main(main: &Path, piece: &Path, full_ref: &str, short: &str,
     let dst = if final_dst { format!("refs/remotes/origin/{}", short) } else { format!("refs/rgc/wip/{}", short) };
     let refspec = format!("+{}:{}", full_ref, dst);
     run_git(&["fetch", "--quiet", piece.to_string_lossy().as_ref(), &refspec], Some(main))?;
+    // B1: 从浅仓搬运会被 git 静默拒绝（shallow roots 禁更新 → warning + exit 0 静默），必须显式断言目标 ref 已落地（审查 B1）
+    run_git(&["rev-parse", "--verify", &dst], Some(main))
+        .map_err(|_| anyhow::anyhow!("transport_to_main: ref {} not created (piece 可能仍为浅仓, 或搬运被拒 — shallow roots 禁更新)", dst))?;
     if final_dst {
         let _ = run_git(&["update-ref", "-d", &format!("refs/rgc/wip/{}", short)], Some(main));
     }
