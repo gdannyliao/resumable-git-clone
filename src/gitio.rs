@@ -18,7 +18,10 @@ pub fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<GitOutput> {
     }
     // 无人值守工具：禁止 git 打开 /dev/tty 索要凭据（会永久挂死）；固定 C locale（classify 依赖英文 stderr）
     cmd.env("GIT_TERMINAL_PROMPT", "0").env("LC_ALL", "C");
-    let out = cmd.output().with_context(|| format!("failed to spawn git {:?}", args))?;
+    let out = cmd.output().with_context(|| {
+        let shown: Vec<String> = args.iter().map(|a| redact(a)).collect();
+        format!("failed to spawn git {:?}", shown)
+    })?;
     let res = GitOutput {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
