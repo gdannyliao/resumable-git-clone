@@ -1,3 +1,4 @@
+/// Fixture 回归测试：确认 build_origin 产出的裸仓库 ref 集合精确符合预期。
 mod common;
 use common::*;
 
