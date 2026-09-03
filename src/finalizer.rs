@@ -7,19 +7,24 @@ pub fn finalize(plan: &Plan, main: &Path, keep_state: bool) -> Result<()> {
     // 0. remote 配置先行（catch-up fetch 依赖 refspec）
     run_git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], Some(main))?;
     run_git(&["config", "remote.origin.url", &plan.url], Some(main))?;
-    // 1. 收尾 fetch：捕获 ls-remote 之后的漂移 + 一切遗漏的兜底
-    run_git(&["fetch", "--quiet", "--prune", "--tags", "origin"], Some(main))?;
-    // 2. 默认分支 + checkout（与 git clone 布局对齐）
+    // 1. 收尾 fetch：捕获 ls-remote 之后的漂移 + 一切遗漏的兜底。
+    // --force --prune-tags：被强移的 tag 更新到新 OID、被删的 tag 移除——与新鲜远端收敛
+    //（非强制的 --tags 对 moved tag 会 "would clobber" 永久失败，对 deleted tag 静默保留旧值）。
+    // 不加 --quiet：run_git 已捕获两路输出，失败时 git 的拒绝原因必须进错误消息。
+    run_git(&["fetch", "--force", "--prune", "--prune-tags", "--tags", "origin"], Some(main))?;
+    // 2. 校验（在 checkout 之前：失败时不留下看似可用的半成品布局）
+    verify(plan, main)?;
+    // 3. 默认分支 + checkout（与 git clone 布局对齐）
     let db = default_branch(plan);
     run_git(&["checkout", "-B", &db, &format!("refs/remotes/origin/{}", db)], Some(main))
         .with_context(|| format!("checkout {}", db))?;
     run_git(&["config", &format!("branch.{}.remote", db), "origin"], Some(main))?;
     run_git(&["config", &format!("branch.{}.merge", db), &format!("refs/heads/{}", db)], Some(main))?;
-    // 3. 校验
-    verify(plan, main)?;
     // 4. 清理
     if !keep_state {
-        let _ = std::fs::remove_dir_all(main.join(".rgc"));
+        if let Err(e) = std::fs::remove_dir_all(main.join(".rgc")) {
+            eprintln!("warning: failed to remove .rgc/ after successful finalize: {}", e);
+        }
     }
     Ok(())
 }
@@ -56,7 +61,14 @@ pub fn verify(plan: &Plan, main: &Path) -> Result<()> {
         }
     }
     if !bad.is_empty() {
-        bail!("verification failed, missing/mismatched refs: {:?}", bad);
+        // 诊断封顶（同 A.12 oracle 决策）：只报数量 + 前 10 条
+        bad.sort();
+        let shown: Vec<String> = bad.iter().take(10).cloned().collect();
+        bail!(
+            "verification failed, missing/mismatched refs ({} total, showing up to 10): {:?}",
+            bad.len(),
+            shown
+        );
     }
     run_git(&["rev-list", "--objects", "--all", "--quiet"], Some(main))?;
     Ok(())
