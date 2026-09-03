@@ -146,6 +146,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     RateLimited,
+    Congestion,
     Network,
     ShallowUnsupported,
     Fatal,
@@ -154,7 +155,8 @@ pub enum FailureKind {
 #[derive(Debug)]
 pub enum RgcError {
     RateLimited(String),
-    Retryable(String),
+    Congestion(String),
+    Network(String),
     ShallowUnsupported(String),
     Fatal(String),
 }
@@ -163,7 +165,8 @@ impl RgcError {
     pub fn kind(&self) -> FailureKind {
         match self {
             RgcError::RateLimited(_) => FailureKind::RateLimited,
-            RgcError::Retryable(_) => FailureKind::Network,
+            RgcError::Congestion(_) => FailureKind::Congestion,
+            RgcError::Network(_) => FailureKind::Network,
             RgcError::ShallowUnsupported(_) => FailureKind::ShallowUnsupported,
             RgcError::Fatal(_) => FailureKind::Fatal,
         }
@@ -172,9 +175,21 @@ impl RgcError {
     pub fn message(&self) -> &str {
         match self {
             RgcError::RateLimited(m)
-            | RgcError::Retryable(m)
+            | RgcError::Congestion(m)
+            | RgcError::Network(m)
             | RgcError::ShallowUnsupported(m)
             | RgcError::Fatal(m) => m,
+        }
+    }
+
+    /// Task 4 的 run_git 用这个构造，避免 match 重复
+    pub fn from_kind(kind: FailureKind, msg: String) -> Self {
+        match kind {
+            FailureKind::RateLimited => RgcError::RateLimited(msg),
+            FailureKind::Congestion => RgcError::Congestion(msg),
+            FailureKind::Network => RgcError::Network(msg),
+            FailureKind::ShallowUnsupported => RgcError::ShallowUnsupported(msg),
+            FailureKind::Fatal => RgcError::Fatal(msg),
         }
     }
 }
@@ -192,17 +207,36 @@ pub fn kind_of(err: &anyhow::Error) -> FailureKind {
     err.downcast_ref::<RgcError>().map(|e| e.kind()).unwrap_or(FailureKind::Fatal)
 }
 
-/// 按 git stderr 关键词分类。429/限流单独一类（不计片重试、触发全局降速）。
+/// 按 git stderr 关键词分类。
+/// RateLimited/Congestion 触发全局降速（不计片重试预算）；Network 计预算可退避重试；
+/// ShallowUnsupported 触发"退化整支 fetch"；Fatal 放弃。
+/// 关键词锚定真实 git/curl 输出（勿用臆造字符串）。
 pub fn classify(stderr: &str) -> FailureKind {
     let s = stderr.to_lowercase();
-    if s.contains("429") || s.contains("rate limit") || s.contains("secondary rate") || s.contains("abuse") {
+    if ["http 429", "returned error: 429", "error: 429"].iter().any(|k| s.contains(k))
+        || s.contains("rate limit")
+        || s.contains("secondary rate")
+        || s.contains("abuse")
+    {
         FailureKind::RateLimited
-    } else if ["could not resolve host", "connection reset", "connection refused", "timed out", "early eof", "rpc failed", "unable to access", "temporary failure"]
-        .iter()
-        .any(|k| s.contains(k))
+    } else if s.contains("connection reset") {
+        FailureKind::Congestion
+    } else if [
+        "could not resolve host",
+        "connection refused",
+        "the remote end hung up",
+        "could not read from remote repository",
+        "timed out",
+        "early eof",
+        "rpc failed",
+        "unable to access",
+        "temporary failure",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
     {
         FailureKind::Network
-    } else if s.contains("shallow") && (s.contains("not supported") || s.contains("dumb http")) {
+    } else if s.contains("does not support shallow") || (s.contains("shallow") && s.contains("dumb http")) {
         FailureKind::ShallowUnsupported
     } else {
         FailureKind::Fatal
@@ -213,22 +247,45 @@ pub fn classify(stderr: &str) -> FailureKind {
 mod tests {
     use super::*;
 
+    // —— 真实 git/curl 输出（从 git 2.50 二进制/源码锚定） ——
+
     #[test]
     fn classify_network_error() {
-        let msg = "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com";
-        assert_eq!(classify(msg), FailureKind::Network);
-        assert_eq!(classify("error: RPC failed; curl 56 Recv failure: Connection reset by peer"), FailureKind::Network);
+        assert_eq!(
+            classify("fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com"),
+            FailureKind::Network
+        );
+        assert_eq!(classify("fatal: the remote end hung up unexpectedly"), FailureKind::Network);
+        assert_eq!(classify("fatal: Could not read from remote repository."), FailureKind::Network);
+        assert_eq!(classify("error: RPC failed; curl 56 OpenSSL SSL_read: error"), FailureKind::Network);
     }
 
     #[test]
     fn classify_rate_limit() {
         assert_eq!(classify("error: RPC failed; The requested URL returned error: 429"), FailureKind::RateLimited);
         assert_eq!(classify("remote: abuse detection triggered"), FailureKind::RateLimited);
+        // 进度计数里的 "1429" 不得误判
+        assert_eq!(
+            classify("remote: Enumerating objects: 1429, done.\nfatal: the remote end hung up unexpectedly"),
+            FailureKind::Network
+        );
+        // 优先级：429 与网络关键词同时出现 → RateLimited
+        assert_eq!(
+            classify("fatal: unable to access 'https://x/': The requested URL returned error: 429"),
+            FailureKind::RateLimited
+        );
+    }
+
+    #[test]
+    fn classify_congestion() {
+        assert_eq!(classify("error: RPC failed; curl 56 Recv failure: Connection reset by peer"), FailureKind::Congestion);
     }
 
     #[test]
     fn classify_shallow_unsupported() {
-        assert_eq!(classify("fatal: shallow fetch is not supported over dumb http"), FailureKind::ShallowUnsupported);
+        assert_eq!(classify("fatal: Server does not support shallow clients"), FailureKind::ShallowUnsupported);
+        assert_eq!(classify("fatal: Server does not support shallow requests"), FailureKind::ShallowUnsupported);
+        assert_eq!(classify("dumb http transport does not support shallow capabilities"), FailureKind::ShallowUnsupported);
     }
 
     #[test]
@@ -238,8 +295,27 @@ mod tests {
 
     #[test]
     fn kind_of_wraps_through_anyhow() {
-        let e: anyhow::Error = RgcError::Retryable("boom".into()).into();
+        let e: anyhow::Error = RgcError::Network("boom".into()).into();
         assert_eq!(kind_of(&e), FailureKind::Network);
+    }
+
+    #[test]
+    fn kind_of_unknown_is_fatal() {
+        let e = anyhow::anyhow!("disk low");
+        assert_eq!(kind_of(&e), FailureKind::Fatal);
+    }
+
+    #[test]
+    fn from_kind_roundtrips() {
+        for (k, msg) in [
+            (FailureKind::RateLimited, "a"),
+            (FailureKind::Congestion, "b"),
+            (FailureKind::Network, "c"),
+            (FailureKind::ShallowUnsupported, "d"),
+            (FailureKind::Fatal, "e"),
+        ] {
+            assert_eq!(RgcError::from_kind(k, msg.into()).kind(), k);
+        }
     }
 }
 ```
@@ -247,7 +323,7 @@ mod tests {
 - [ ] **Step 3: 跑测试**
 
 Run: `cargo test -q errors`
-Expected: `test result: ok. 5 passed`
+Expected: `test result: ok. 8 passed`
 
 - [ ] **Step 4: Commit**
 
