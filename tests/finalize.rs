@@ -105,17 +105,13 @@ fn new_remote_branch_is_included() {
     assert!(got.is_ok(), "计划之后新增的远端分支必须被 catch-up 收入");
 }
 
-/// keep_state=true 保留 .rgc/；校验失败时不清理（可续传）
+/// keep_state=true 保留 .rgc/
 #[test]
 fn keep_state_and_failure_atomicity() {
     let origin = build_origin(10, &[], &[("v1", 5)]);
     let url = origin.to_str().unwrap();
     let td = tempfile::tempdir().unwrap();
     let (main, plan) = setup_finalizable(td.path(), &origin, url);
-    // 破坏本地一个 tag 的 OID → verify 必须失败且保留 .rgc/
-    rgc::gitio::run_git(&["update-ref", "refs/tags/v1", "0123456789012345678901234567890123456789"], Some(&main)).is_err(); // update-ref 拒绝坏对象属预期
-    // 用另一种方式制造失配：删掉本地 tag ref 后 verify 仍应通过 catch-up 修复……
-    // 这里直接测 keep_state 路径：
     rgc::finalizer::finalize(&plan, &main, true).unwrap();
     assert!(main.join(".rgc").exists(), "keep_state=true 必须保留状态目录");
 }
