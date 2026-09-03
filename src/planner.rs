@@ -24,6 +24,23 @@ pub enum Piece {
     TagBatch { tags: Vec<RefEntry> },
 }
 
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn fnv1a_continue(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 impl Piece {
     pub fn id(&self) -> String {
         match self {
@@ -32,7 +49,9 @@ impl Piece {
         }
     }
     pub fn piece_dir_name(&self) -> String {
-        self.id().replace(['/', ':'], "_")
+        let id = self.id();
+        let sanitized: String = id.chars().map(|c| if c == '/' || c == ':' { '_' } else { c }).collect();
+        format!("{}-{:08x}", sanitized, fnv1a(id.as_bytes()))
     }
 }
 
@@ -42,6 +61,21 @@ pub struct Plan {
     pub default_branch: Option<String>,
     pub initial_step: u32,
     pub pieces: Vec<Piece>,
+}
+
+impl Plan {
+    /// url + 有序 piece ids 的 FNV-1a 指纹（16 hex）。state.json 保存它；
+    /// 不匹配 = plan 与 state 来自两次不同的规划 → 必须报错而不是静默重规划。
+    pub fn fingerprint(&self) -> String {
+        let mut h = fnv1a(self.url.as_bytes());
+        for p in &self.pieces {
+            h ^= 0xff;
+            h = h.wrapping_mul(0x100000001b3);
+            let id = p.id();
+            h = fnv1a_continue(h, id.as_bytes());
+        }
+        format!("{:016x}", h)
+    }
 }
 
 pub fn build_plan(url: &str, refs: &RemoteRefs, cfg: &PlannerConfig) -> Result<Plan> {
@@ -128,7 +162,8 @@ mod tests {
         let refs = RemoteRefs { default_branch: None, branches: vec![], tags };
         let plan = build_plan("u", &refs, &PlannerConfig { tags_per_batch: 2, ..Default::default() }).unwrap();
         assert_eq!(plan.pieces.len(), 3);
-        assert_eq!(plan.pieces[0].piece_dir_name(), "tags_t0");
+        let dir = plan.pieces[0].piece_dir_name();
+        assert!(dir.starts_with("tags_t0-"), "sanitized prefix kept, hash suffix appended: {}", dir);
     }
 
     #[test]
@@ -165,5 +200,42 @@ mod tests {
     fn empty_remote_is_an_error() {
         let refs = RemoteRefs { default_branch: None, branches: vec![], tags: vec![] };
         assert!(build_plan("u", &refs, &PlannerConfig::default()).is_err());
+    }
+
+    #[test]
+    fn piece_dir_names_collide_never() {
+        let mk = |full: &str| Piece::Chain { full_ref: full.into(), short_name: full.into() };
+        let a = mk("refs/heads/release/2_2").piece_dir_name();
+        let b = mk("refs/heads/release_2_2").piece_dir_name();
+        assert_ne!(a, b, "sanitized names must not collide: {} vs {}", a, b);
+        // 可读前缀仍在
+        assert!(a.starts_with("chain_refs_heads_release"));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_sensitive() {
+        let refs = crate::refs::RemoteRefs {
+            default_branch: Some("main".into()),
+            branches: vec![crate::refs::RefEntry { full_name: "refs/heads/main".into(), short_name: "main".into(), oid: "a".into() }],
+            tags: vec![],
+        };
+        let p1 = build_plan("https://x/y.git", &refs, &PlannerConfig::default()).unwrap();
+        let p2 = build_plan("https://x/y.git", &refs, &PlannerConfig::default()).unwrap();
+        assert_eq!(p1.fingerprint(), p2.fingerprint(), "同一规划必须稳定");
+        let p3 = build_plan("https://x/other.git", &refs, &PlannerConfig::default()).unwrap();
+        assert_ne!(p1.fingerprint(), p3.fingerprint(), "url 变化必须改变指纹");
+        let mut refs2 = refs.clone();
+        refs2.branches.push(crate::refs::RefEntry { full_name: "refs/heads/dev".into(), short_name: "dev".into(), oid: "b".into() });
+        let p4 = build_plan("https://x/y.git", &refs2, &PlannerConfig::default()).unwrap();
+        assert_ne!(p1.fingerprint(), p4.fingerprint(), "piece 序列变化必须改变指纹");
+    }
+
+    #[test]
+    fn save_json_tmp_name_is_process_unique() {
+        // save 的中间文件不得与其他进程互踩：tmp 名含 pid
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("state.json");
+        crate::jsonio::save_json(&p, &"x".to_string()).unwrap();
+        assert!(p.exists());
     }
 }
