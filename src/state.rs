@@ -83,17 +83,27 @@ impl State {
 }
 
 /// state.json 缺失/损坏时的对账重建：
-/// 先 fsck 验证主仓库完整性；不健康 → 清掉 remotes/wip 引用与片仓库从头来
-/// （防止"撒谎的 have"）；健康 → 按已存在 refs 标 Done，其余 Pending。
+/// 先 fsck 验证主仓库完整性；不健康 → 清掉 remote 侧全部引用（origin/tags/rgc）与片仓库
+/// （防止"撒谎的 have"），二次 fsck 仍失败 → 损坏在擦除范围之外（对象库本体），
+/// 擦除无法治愈它会陷入永久循环，直接放弃并提示删目录重克；
+/// 健康 → 按已存在 refs 标 Done，其余 Pending。
 pub fn reconcile(plan: &Plan, main: &Path) -> State {
+    // fsck 在大仓库上可能要几分钟，先打招呼避免用户误以为挂死
+    eprintln!("verifying repository integrity, this can take minutes on large repos...");
     let healthy = gitio::run_git(&["fsck", "--connectivity-only"], Some(main)).is_ok();
     if !healthy {
-        if let Ok(out) = gitio::run_git(&["for-each-ref", "--format=%(refname)", "refs/remotes/origin", "refs/rgc/wip"], Some(main)) {
+        // 审计轨迹：不可逆销毁前必须留诊断，便于事后追溯
+        eprintln!("warning: fsck failed — wiping all remote-side refs (origin/tags/rgc) and piece repos, then re-verifying");
+        if let Ok(out) = gitio::run_git(&["for-each-ref", "--format=%(refname)", "refs/remotes/origin", "refs/tags", "refs/rgc"], Some(main)) {
             for r in out.stdout.lines() {
                 let _ = gitio::run_git(&["update-ref", "-d", r], Some(main));
             }
         }
         let _ = std::fs::remove_dir_all(pieces_dir(main));
+        // 二次 fsck：仍失败说明损坏在擦除范围之外（refs/tags 或不可达对象），
+        // 继续跑只会每轮擦除-重拉-再失败，永久循环；直接放弃，让用户删目录重克。
+        gitio::run_git(&["fsck", "--connectivity-only"], Some(main))
+            .expect("fatal: repository unrecoverable — delete the directory and re-clone");
     }
     let pieces = plan
         .pieces

@@ -16,8 +16,13 @@ pub fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<GitOutput> {
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    // 无人值守工具：禁止 git 打开 /dev/tty 索要凭据（会永久挂死）；固定 C locale（classify 依赖英文 stderr）
-    cmd.env("GIT_TERMINAL_PROMPT", "0").env("LC_ALL", "C");
+    // 无人值守工具：禁止 git 打开 /dev/tty 索要凭据（会永久挂死）；固定 C locale（classify 依赖英文 stderr）。
+    // 同时擦除继承的 GIT_* 定位变量：rgc 常从 git hook / wrapper 里被调用，
+    // 调用方环境里的 GIT_DIR 等会把子 git 重定向到别的仓库（静默写错仓库，极难排查）。
+    cmd.env("GIT_TERMINAL_PROMPT", "0").env("LC_ALL", "C")
+        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE").env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
     let out = cmd.output().with_context(|| {
         let shown: Vec<String> = args.iter().map(|a| redact(a)).collect();
         format!("failed to spawn git {:?}", shown)
