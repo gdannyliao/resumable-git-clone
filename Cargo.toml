@@ -1,0 +1,16 @@
+[package]
+name = "rgc"
+version = "0.1.0"
+edition = "2021"
+description = "Resumable git clone for very large repositories"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+indicatif = "0.17"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
