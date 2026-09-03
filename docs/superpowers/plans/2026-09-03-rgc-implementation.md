@@ -2357,3 +2357,5 @@ Task 6 落地后的实际 API（commits 92349a5, f5b99fa）：
 
 9. **Task 8 审查修复已落地（7a5e5a3）**：(a) `transport_to_main` 加 post-fetch `rev-parse --verify` 断言（浅仓搬运静默拒绝转为显式错误）；(b) `stale_shallow_boundary` + `fetch_chain_step` 顶部重置（force-push 悬空边界 → --depth 重取）；(c) `ensure_piece_repo` 含 HEAD symbolic-ref 防护与强化健康探针（绝对 git-dir 一致性 + alternates 校验）。
 10. **Task 12 派发须知**：(a) 分支在克隆中途被远端删除 → "couldn't find remote ref" 目前分类为 Fatal → 会整体失败；Task 12 应在该错误上重查 ls-remote 并标记片为 skipped 而非 failed；(b) 链完成后的远端漂移由 Task 11 catch-up fetch 兜底（`fetch_chain_step` 对已完整分支是 no-op，勿当 catch-up 用）；(c) D/F 冲突远端（feature 与 feature/x 并存）可能导致 `cannot lock ref` → Fatal，Task 11/12 需注意（MVP 文档化为不支持）。
+
+11. **Task 9 审查修复已落地（3c86e40）**：tag 批量原语加空批次早返回（防默认 refspec 全量拉取/未出生 HEAD 报错）；transport 断言升级为"存在且等于钉住 OID"；文档注释修正（按 OID fetch 保证确定性而非显式失败，漂移由 Finalizer 兜底）；补 annotated tag 与空批次测试。Task 12 错误分诊：tag 批 `not our ref` / `couldn't find remote ref` → 重查 ls-remote 后标记 skipped（同 A.10a）。
