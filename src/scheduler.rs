@@ -1,8 +1,9 @@
 //! Task 12：串行调度核心 —— write-ahead 状态机驱动的片执行引擎。
 //!
 //! write-ahead 不变式：片开始执行前，状态先落盘（Pending→Running，崩溃后
-//! `State::load` 把 Running 折返 Pending）；执行结束后再落盘（Done / attempts++）。
-//! 片仓库的实际 fetch 进度（refs/heads/*、shallow 文件）自描述，重跑零浪费。
+//! `State::load` 把 Running 折返 Pending）；执行结束后再落盘（Done / Failed
+//! 终态 / attempts++）。片仓库的实际 fetch 进度（refs/heads/*、shallow 文件）
+//! 自描述，重跑零浪费。
 //!
 //! 附录 A.6：git 拒绝从浅仓搬运（shallow roots 禁更新，exit 0 静默）——链式片
 //! 只在完成后（`!is_shallow`）做一次 final 搬运，中途不做 wip 搬运
@@ -26,7 +27,8 @@ pub struct SchedulerConfig {
 }
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        Self { max_attempts: 4, target_secs: 600.0, cooldown: Arc::new(Mutex::new(Instant::now())) }
+        // spec §5：默认 5 次
+        Self { max_attempts: 5, target_secs: 600.0, cooldown: Arc::new(Mutex::new(Instant::now())) }
     }
 }
 
@@ -73,6 +75,13 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
         // state 缺失/损坏（load_json 把损坏视同缺失）→ 对账重建
         None => crate::state::reconcile(plan, main),
     };
+    // C1：Failed 是上一轮的终态 —— rerun 折返 Pending 重新出发
+    //（认领时 rebill 给全新预算），终态片不占坑、可重试。
+    for p in &mut st.pieces {
+        if p.status == PieceStatus::Failed {
+            p.status = PieceStatus::Pending;
+        }
+    }
     st.save(main)?;
     worker(plan, main, &mut st, cfg)?;
     let failed: Vec<String> = st
@@ -89,7 +98,7 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
 
 /// 串行工作循环：认领 → 执行 → 记账，直至无 Pending 片。
 /// 单片失败不中止整个 run（否则"最后统一列出失败片"就是死代码）：
-/// 片留在 Pending（attempts 已落盘），run 结束时统一报告，rerun 续跑。
+/// GiveUp 片落终态 Failed，run 结束时统一报告；rerun 由 run() 折返重试。
 fn worker(plan: &Plan, main: &Path, st: &mut State, cfg: &SchedulerConfig) -> Result<()> {
     loop {
         // 全局冷却：限流/拥塞后，后续片一律推迟（spec §4.4）
@@ -101,7 +110,13 @@ fn worker(plan: &Plan, main: &Path, st: &mut State, cfg: &SchedulerConfig) -> Re
         let Some(idx) = st.pieces.iter().position(|p| p.status == PieceStatus::Pending) else {
             break;
         };
-        // write-ahead 认领：Running 先落盘再执行；保存失败绝不带伤执行
+        // write-ahead 认领：Running 先落盘再执行；保存失败绝不带伤执行。
+        // C2：认领时给耗尽预算的片重新计费 —— attempts 只约束单次 run 内的重试，
+        // rerun 给每个片全新预算。（旧位置在 run_piece 里判 `status == Pending`，
+        // 而此处 write-ahead 认领早已置 Running → 条件永假，是死代码。）
+        if st.pieces[idx].attempts > cfg.max_attempts {
+            st.pieces[idx].attempts = 0;
+        }
         st.pieces[idx].status = PieceStatus::Running;
         st.save(main)?;
         let id = st.pieces[idx].id.clone();
@@ -139,12 +154,8 @@ fn execute_piece(plan: &Plan, main: &Path, st: &mut State, idx: usize, cfg: &Sch
 }
 
 /// 片执行 + 重试循环。错误计预算（attempts++），按 decide 分诊：
-/// GiveUp 留在 Pending（片仓库进度自描述，rerun 重新计费后可续跑）。
+/// GiveUp 落终态 Failed（片已定局：本轮不再碰它，rerun 由 run() 折返重试）。
 fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mut PieceState, cfg: &SchedulerConfig) -> Result<()> {
-    // 新进程恢复：给耗尽预算的片重新计费（attempts 只约束单次 run 内的重试）
-    if ps.status == PieceStatus::Pending && ps.attempts > cfg.max_attempts {
-        ps.attempts = 0;
-    }
     loop {
         let res = match piece {
             Piece::Chain { .. } => {
@@ -165,7 +176,10 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
                 ps.attempts += 1;
                 match decide(ps.attempts, kind_of(&e), cfg.max_attempts) {
                     Action::GiveUp => {
-                        ps.status = PieceStatus::Pending;
+                        // C1：终态 Failed —— 认领只挑 Pending，工作循环不再
+                        // 重认领本片（修复前折回 Pending → 无限重认领热循环，
+                        // run() 永不返回）；run 结束统一报告，rerun 折返重试。
+                        ps.status = PieceStatus::Failed;
                         return Err(e);
                     }
                     Action::RetryNoShallow => {
@@ -200,7 +214,19 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
     let mut depth_done = chain.depth_done;
     let mut step = chain.step;
     gitio::ensure_piece_repo(main, &piece_path, &plan.url)?;
+    // A.5：单次 run_chain 调用的迭代上限 —— 步长自适应失灵（或上游状态机出 bug）
+    // 时兜底：返回可重试的 Network 错误，让 attempts 预算机制接管，绝不无限打转。
+    const MAX_CHAIN_ITERATIONS: u32 = 100_000;
+    let mut iterations: u32 = 0;
     loop {
+        iterations += 1;
+        if iterations > MAX_CHAIN_ITERATIONS {
+            return Err(RgcError::Network(format!(
+                "chain piece {} exceeded {MAX_CHAIN_ITERATIONS} fetch iterations without completing — aborting this run (retryable)",
+                ps.id
+            ))
+            .into());
+        }
         let (b0, c0) = gitio::repo_stats(&piece_path, short)?;
         let t0 = Instant::now();
         // TODO(A.10a): 远端在克隆中途删分支 → "couldn't find remote ref" 目前分类
@@ -215,11 +241,12 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
         // 记账在分诊之前：run_piece 的重试动作（减半/退化）都从最新状态出发
         ps.chain = Some(ChainState { depth_done, step, no_shallow: chain.no_shallow });
         let complete = !gitio::is_shallow(&piece_path);
-        // A.5 零推进守卫：单次 fetch 新增 0 字节且浅边界未消失 → 可重试错误
-        //（计入 attempts 预算），防止空 pack 死循环。
-        if added_bytes == 0 && !complete {
+        // A.5 零推进守卫：单次 fetch 新增 0 字节、提交计数不变且浅边界未消失
+        // → 可重试错误（计入 attempts 预算），防止空 pack 死循环。dir_size 粒度
+        // 可能掩盖真实推进（同字节数的引用更新），故提交计数不变才是必要条件。
+        if added_bytes == 0 && c1 == c0 && !complete {
             return Err(RgcError::Network(format!(
-                "zero-progress fetch on {} (depth_done={depth_done}, step={step}) — empty pack, shallow boundary persists",
+                "zero-progress fetch on {} (depth_done={depth_done}, step={step}, +0 bytes, +0 commits) — empty pack, shallow boundary persists",
                 ps.id
             ))
             .into());

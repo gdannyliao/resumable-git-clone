@@ -9,6 +9,9 @@ pub enum PieceStatus {
     Pending,
     Running,
     Done,
+    /// 终态：GiveUp（预算内重试耗尽或不可恢复错误）。run 结束统一报告失败片；
+    /// rerun 时 run() 把 Failed 折返 Pending —— 认领时 rebill 给全新预算。
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
