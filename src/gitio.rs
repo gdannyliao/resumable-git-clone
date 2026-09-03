@@ -240,12 +240,16 @@ pub fn transport_to_main(main: &Path, piece: &Path, full_ref: &str, short: &str,
 }
 
 /// 一次连接批量 fetch tags（片仓库内执行）。
-/// 按 ls-remote 钉住的 OID fetch（不按名字）：远端在计划生成后重定向 tag 时，
-/// 按 OID fetch 显式失败而非静默拿到新对象——计划与产物确定性绑定。
+/// 按 ls-remote 钉住的 OID fetch（不按名字）：保证拿到的正是钉住的对象——计划与产物确定性绑定。
+/// 注意：远端重定向 tag 后按旧 OID fetch 在 git ≥ 2.21 服务端会静默返回旧对象（并非显式失败）；
+/// 漂移由 Finalizer 的 catch-up fetch（按名字）+ verify()（对照新鲜 ls-remote）兜底检测。
 /// refspec 目标统一写 refs/tags/<short>；annotated / lightweight tag 一视同仁
 /// （t.oid 对 annotated 是 tag 对象本身，目标 ref 指向 tag 对象，与远端一致）。
 /// 注意：tag fetch 永不加 --depth——浅仓搬运被 git 禁止（附录 A.6），tag 片绝不能浅。
 pub fn fetch_tag_batch(piece: &Path, tags: &[crate::refs::RefEntry]) -> Result<()> {
+    if tags.is_empty() {
+        return Ok(()); // 空 refspec 会让 fetch 走 remote.origin.fetch 默认值，静默拉满全部分支
+    }
     let mut args: Vec<String> = vec!["fetch".into(), "--quiet".into(), "--no-tags".into(), "origin".into()];
     for t in tags {
         args.push(format!("+{}:refs/tags/{}", t.oid, t.short_name));
@@ -258,9 +262,12 @@ pub fn fetch_tag_batch(piece: &Path, tags: &[crate::refs::RefEntry]) -> Result<(
 /// tags 成果搬运进主仓库（tag fetch 原子完整，直接写正式命名空间 refs/tags/*）。
 /// 同样按钉住 OID fetch；--no-tags 必须保留：auto-follow 会为同一 dst 提供按名字的
 /// 隐式更新，与按 OID 的显式 refspec 冲突（"Cannot fetch both X and Y to the same ref"）。
-/// 随后逐 tag 断言已落地（B1 模式，与 transport_to_main 同）：
+/// 随后逐 tag 断言已落地且等于钉住 OID（B1 模式，与 transport_to_main 同）：
 /// git 对被拒的 ref 更新可能 exit 0 静默，失败的 tag 必须显式报错并点名。
 pub fn transport_tags_to_main(main: &Path, piece: &Path, tags: &[crate::refs::RefEntry]) -> Result<()> {
+    if tags.is_empty() {
+        return Ok(()); // 空 refspec 的 fetch 会因 piece 未出生的 HEAD 直接报错
+    }
     let mut args: Vec<String> = vec!["fetch".into(), "--quiet".into(), "--no-tags".into(), piece.to_string_lossy().into_owned()];
     for t in tags {
         args.push(format!("+{}:refs/tags/{}", t.oid, t.short_name));
@@ -269,8 +276,12 @@ pub fn transport_tags_to_main(main: &Path, piece: &Path, tags: &[crate::refs::Re
     run_git(&refs, Some(main))?;
     for t in tags {
         let dst = format!("refs/tags/{}", t.short_name);
-        run_git(&["rev-parse", "--verify", &dst], Some(main))
+        let got = run_git(&["rev-parse", "--verify", &dst], Some(main))
             .map_err(|_| anyhow::anyhow!("transport_tags_to_main: tag {} not created in main (搬运被拒或对象缺失, 钉住 OID {})", dst, t.oid))?;
+        let landed = got.stdout.trim();
+        if landed != t.oid {
+            anyhow::bail!("transport_tags_to_main: tag {} 内容不符: 落地 {} 但计划钉住 {}", dst, landed, t.oid);
+        }
     }
     Ok(())
 }
