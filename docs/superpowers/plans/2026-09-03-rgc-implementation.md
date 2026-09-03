@@ -2350,3 +2350,7 @@ Task 6 落地后的实际 API（commits 92349a5, f5b99fa）：
 3. **`piece_dir_name()` 含 8-hex 后缀**（如 `chain_refs_heads_main-1a2b3c4d`）：正文代码块中手写的 piece 目录名断言一律改用 `piece.piece_dir_name()`。
 4. **`save_json` 的 tmp 文件名含 pid**：`<stem>.tmp.<pid>`；Task 15 须加 fs2 实例锁（`.rgc/lock` `try_lock_exclusive`，冲突 → `bail!("another rgc instance is running")`）作为多进程根防。
 5. **Task 12 `run_chain` 零推进守卫**：单次 fetch 新增 0 字节且浅边界未消失 → 返回可重试错误（计入 attempts 预算），防止空 pack 死循环。
+
+6. **wip 中途搬运的物理限制（Task 7 质量审查实证）**：git 禁止从浅仓库搬运——以浅根为目标的 ref 更新被拒（`warning: rejected ... shallow roots are not allowed to be updated`，**exit 0 静默**）。因此 Task 12 `run_chain` 只在链完成（`!is_shallow(piece)`）时调用 `transport_to_main(final_dst=true)`；**中途不做 wip 搬运**（plan 正文"每步立即搬运"的注释作废）。wip 命名空间保留为防御（reconcile 仍清 `refs/rgc/*`），调度器永不写 wip。have 诚实性不变式反而简化：主仓库 ref 只来自完成搬运，永远诚实。
+7. **reconcile 健康门（已落地 cca97ce）**：wipe 范围含 `refs/tags` + `refs/rgc`；擦除后二次 fsck，仍失败 → panic "repository unrecoverable"。
+8. **Task 15 契约**：fs2 实例锁须在 load_plan/reconcile **之前**取得（reconcile 有破坏性 wipe）；`status` 只读，state 缺失/损坏时提示"run resume to rebuild"而**不**调用 reconcile。
