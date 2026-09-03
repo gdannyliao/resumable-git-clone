@@ -334,7 +334,7 @@ git commit -m "test: repo fixture builder"
 - [ ] **Step 2: 写 src/gitio.rs（先只放本任务的原语，含测试）**
 
 ```rust
-use crate::errors::{classify, FailureKind, RgcError};
+use crate::errors::{classify, RgcError};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
@@ -357,12 +357,8 @@ pub fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<GitOutput> {
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     };
     if !out.status.success() {
-        return Err(match classify(&res.stderr) {
-            FailureKind::RateLimited => RgcError::RateLimited(res.stderr),
-            FailureKind::Network => RgcError::Retryable(res.stderr),
-            FailureKind::ShallowUnsupported => RgcError::ShallowUnsupported(res.stderr),
-            FailureKind::Fatal => RgcError::Fatal(format!("git {:?} failed: {}", args, res.stderr)),
-        });
+        let msg = format!("git {:?} failed: {}", args, res.stderr.trim_end());
+        return Err(RgcError::from_kind(classify(&res.stderr), msg));
     }
     Ok(res)
 }
@@ -1501,7 +1497,7 @@ pub fn backoff_secs(attempts: u32) -> u64 {
 }
 
 /// 重试决策：Fatal→放弃；Shallow 不支持→退化整支 fetch；
-/// 限流→长退避（不计片预算）；网络失败第 2 次起步长减半。
+/// 限流→长退避（不计片预算）；拥塞(reset)→退避+全局冷却；网络失败第 2 次起步长减半。
 pub fn decide(attempts: u32, kind: FailureKind, max_attempts: u32) -> Action {
     if attempts > max_attempts {
         return Action::GiveUp;
@@ -1510,6 +1506,7 @@ pub fn decide(attempts: u32, kind: FailureKind, max_attempts: u32) -> Action {
         FailureKind::ShallowUnsupported => Action::RetryNoShallow,
         FailureKind::Fatal => Action::GiveUp,
         FailureKind::RateLimited => Action::RetryAfter(60u64 << attempts.min(2)),
+        FailureKind::Congestion => Action::RetryAfter(backoff_secs(attempts)),
         FailureKind::Network if attempts >= 2 => Action::HalveAndRetry,
         FailureKind::Network => Action::RetryAfter(backoff_secs(attempts)),
     }
@@ -1583,12 +1580,12 @@ fn worker(
             found
         };
         let Some(i) = claimed else { break };
-        execute_piece(&plan, &main, &state, i, cfg)?;
+        execute_piece(&plan, &main, &state, i, cfg, &cooldown)?;
     }
     Ok(())
 }
 
-fn execute_piece(plan: &Plan, main: &Path, state: &Arc<Mutex<State>>, idx: usize, cfg: &SchedulerConfig) -> Result<()> {
+fn execute_piece(plan: &Plan, main: &Path, state: &Arc<Mutex<State>>, idx: usize, cfg: &SchedulerConfig, cooldown: &Arc<Mutex<Instant>>) -> Result<()> {
     // 磁盘预检：按历史最大片字节 × 1.5 估算
     let max_seen = state.lock().unwrap().pieces.iter().map(|p| p.bytes).max().unwrap_or(0);
     let estimate = (max_seen as f64 * 1.5) as u64;
@@ -1607,6 +1604,12 @@ fn execute_piece(plan: &Plan, main: &Path, state: &Arc<Mutex<State>>, idx: usize
         let mut st = state.lock().unwrap();
         st.pieces[idx] = ps.clone();
         let _ = st.save(main);
+    }
+    // 全局降速：限流/拥塞 → 全体 worker 冷却 60s（spec §4.4）
+    if let Err(e) = &res {
+        if matches!(kind_of(e), FailureKind::RateLimited | FailureKind::Congestion) {
+            *cooldown.lock().unwrap() = Instant::now() + Duration::from_secs(60);
+        }
     }
     res
 }
