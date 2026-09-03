@@ -5,6 +5,7 @@ pub mod gitio;
 pub mod jsonio;
 pub mod planner;
 pub mod refs;
+pub mod scheduler;
 pub mod state;
 
 #[cfg(test)]
