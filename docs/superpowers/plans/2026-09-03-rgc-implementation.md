@@ -2359,3 +2359,5 @@ Task 6 落地后的实际 API（commits 92349a5, f5b99fa）：
 10. **Task 12 派发须知**：(a) 分支在克隆中途被远端删除 → "couldn't find remote ref" 目前分类为 Fatal → 会整体失败；Task 12 应在该错误上重查 ls-remote 并标记片为 skipped 而非 failed；(b) 链完成后的远端漂移由 Task 11 catch-up fetch 兜底（`fetch_chain_step` 对已完整分支是 no-op，勿当 catch-up 用）；(c) D/F 冲突远端（feature 与 feature/x 并存）可能导致 `cannot lock ref` → Fatal，Task 11/12 需注意（MVP 文档化为不支持）。
 
 11. **Task 9 审查修复已落地（3c86e40）**：tag 批量原语加空批次早返回（防默认 refspec 全量拉取/未出生 HEAD 报错）；transport 断言升级为"存在且等于钉住 OID"；文档注释修正（按 OID fetch 保证确定性而非显式失败，漂移由 Finalizer 兜底）；补 annotated tag 与空批次测试。Task 12 错误分诊：tag 批 `not our ref` / `couldn't find remote ref` → 重查 ls-remote 后标记 skipped（同 A.10a）。
+
+12. **Task 10 审查修复已落地**：equivalent oracle 排除 `refs/remotes/origin/HEAD`（git < 2.48 的 fetch 不创建它，否则所有 e2e 在老 git 上假失败；Task 11 finalize 也可用 `git remote set-head origin --auto` 兜底）；`assert_same_refs` 诊断改为差集+上限 10 条；补对象侧负测试与 origin/HEAD 排除测试；`snapshot()` 文档注明内存规模上限（chromium 级不适用）。对象集与 ref 过滤的口径不对称是**刻意的严格性**（--all 只会多报差异，绝不假通过）。
