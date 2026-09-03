@@ -16,15 +16,30 @@ pub struct RemoteRefs {
     pub tags: Vec<RefEntry>,
 }
 
+/// 剥离单一命名空间前缀。不用 trim_start_matches：避免 "refs/heads/refs/heads/x"
+/// 这类字面名字被连环剥皮。
+fn short_name(full: &str) -> String {
+    match full.strip_prefix("refs/heads/") {
+        Some(s) => s.to_string(),
+        None => full.strip_prefix("refs/tags/").unwrap_or(full).to_string(),
+    }
+}
+
 pub fn parse_ls_remote(output: &str) -> RemoteRefs {
     let mut default_branch = None;
     let mut branches = Vec::new();
     let mut tags = Vec::new();
     for line in output.lines() {
-        // --symref 首行形如 "ref: refs/heads/main\tHEAD"
+        // --symref 对每个符号引用输出一行 "ref: <target>\t<refname>"。
+        // 只有 refname == HEAD 的那一行定义默认分支（远端可能广播其他 symref）；
+        // 且 target 必须是分支，否则留给 finalize 的 fallback 逻辑。
         if let Some(rest) = line.strip_prefix("ref: ") {
-            if let Some(name) = rest.split('\t').next() {
-                default_branch = Some(name.trim().trim_start_matches("refs/heads/").to_string());
+            if let Some((target, refname)) = rest.split_once('\t') {
+                if refname.trim() == "HEAD" {
+                    if let Some(name) = target.trim().strip_prefix("refs/heads/") {
+                        default_branch = Some(name.to_string());
+                    }
+                }
             }
             continue;
         }
@@ -37,12 +52,12 @@ pub fn parse_ls_remote(output: &str) -> RemoteRefs {
             "HEAD" => {}
             n if n.starts_with("refs/heads/") => branches.push(RefEntry {
                 full_name: n.to_string(),
-                short_name: n.trim_start_matches("refs/heads/").to_string(),
+                short_name: short_name(n),
                 oid: oid.trim().to_string(),
             }),
             n if n.starts_with("refs/tags/") => tags.push(RefEntry {
                 full_name: n.to_string(),
-                short_name: n.trim_start_matches("refs/tags/").to_string(),
+                short_name: short_name(n),
                 oid: oid.trim().to_string(),
             }),
             _ => {} // refs/pull/* 等一律不拉
@@ -70,5 +85,46 @@ mod tests {
         assert_eq!(r.branches[1].short_name, "dev");
         assert_eq!(r.tags.len(), 1);
         assert_eq!(r.tags[0].oid, "789aaa");
+    }
+
+    #[test]
+    fn second_symref_does_not_override_head() {
+        // 真实形状：HEAD 的 symref 行之后，还有其他符号引用的行
+        let out = "ref: refs/heads/main\tHEAD\n7b8e\tHEAD\nref: refs/heads/b2\trefs/heads/alias\n7b8e\trefs/heads/alias\n7b8e\trefs/heads/main\n";
+        let r = parse_ls_remote(out);
+        assert_eq!(r.default_branch.as_deref(), Some("main"), "HEAD 的 symref 必须获胜");
+        assert_eq!(r.branches.len(), 2);
+    }
+
+    #[test]
+    fn head_symref_to_non_branch_leaves_default_none() {
+        let out = "ref: refs/tags/v1\tHEAD\nabc\tHEAD\nabc\trefs/heads/main\n";
+        let r = parse_ls_remote(out);
+        assert_eq!(r.default_branch, None);
+        assert_eq!(r.branches.len(), 1);
+    }
+
+    #[test]
+    fn repeated_prefix_names_kept_literal() {
+        let out = "abc\trefs/heads/refs/heads/x\ndef\trefs/tags/refs/tags/y\n";
+        let r = parse_ls_remote(out);
+        assert_eq!(r.branches[0].short_name, "refs/heads/x");
+        assert_eq!(r.tags[0].short_name, "refs/tags/y");
+    }
+
+    #[test]
+    fn branch_names_with_spaces_parse() {
+        let out = "abc\trefs/heads/feature with space\n";
+        let r = parse_ls_remote(out);
+        assert_eq!(r.branches[0].short_name, "feature with space");
+    }
+
+    #[test]
+    fn crlf_output_parses() {
+        let out = "ref: refs/heads/main\tHEAD\r\nabc111\trefs/heads/main\r\n";
+        let r = parse_ls_remote(out);
+        assert_eq!(r.default_branch.as_deref(), Some("main"));
+        assert_eq!(r.branches.len(), 1);
+        assert_eq!(r.branches[0].oid, "abc111");
     }
 }
