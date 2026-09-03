@@ -2336,3 +2336,17 @@ git commit -m "test: kill-resume e2e acceptance, CI and README"
 1. **Spec 覆盖**：§3 CLI→T15；Planner→T6；Scheduler→T12–14；State→T7；Finalizer→T11；gitio→T4/8/9；equiv→T10；§4.1 双维度→T6（chains+tag batches）；§4.2 自适应→T6 next_step + T12 halving；§4.3 持久化/恢复/--shared/refs 复制→T7/T8；wip 命名空间→T8/T12；§4.4 jobs→T12/T14；§4.5 等价→T10/T11/T12/T14/T16；§5 错误表→T2/T12（decide、磁盘预检、预算重置、Running 折返）；shallow 不支持退化→T12 RetryNoShallow；§6 测试→T3/10/12/14/16。
 2. **占位符**：无 TBD/TODO；所有步骤含完整代码。
 3. **类型一致性**：`fetch_chain_step(piece, full_ref, short, step, depth_done, no_shallow)`（无 url 参数，origin 在 ensure_piece_repo 配置）；`Plan{url, default_branch, initial_step, pieces}`；`ChainState{depth_done, step, no_shallow}`；`Action` derive PartialEq 供测试断言；`kind_of` 经 anyhow 下转。
+
+---
+
+## 附录 A：审查后批准的契约修订（派发时以下述为准；与正文冲突处本文优先）
+
+Task 6 落地后的实际 API（commits 92349a5, f5b99fa）：
+
+1. **`build_plan` 返回 `Result<Plan>`**：空远端（无分支无 tag）→ `bail!("remote has no branches or tags — nothing to clone")`。正文 Task 7/12/14/15 代码块中裸调 `build_plan(...)` 处，测试代码加 `.unwrap()`、主流程加 `?`。
+2. **`Plan::fingerprint() -> String`**（16-hex FNV-1a，url + 有序 piece id 序列）：
+   - Task 7：`State` 结构体增加 `fingerprint: String` 字段（serde 包含）；`State::new(plan)` 写入 `plan.fingerprint()`。
+   - Task 15：加载后校验 `state.fingerprint == plan.fingerprint`，不匹配 → `bail!("plan/state mismatch — delete .rgc/ or restore plan.json")`；`load_plan` 返回 None（含损坏视为缺失）→ 同样 `bail!`，**绝不静默重规划**。
+3. **`piece_dir_name()` 含 8-hex 后缀**（如 `chain_refs_heads_main-1a2b3c4d`）：正文代码块中手写的 piece 目录名断言一律改用 `piece.piece_dir_name()`。
+4. **`save_json` 的 tmp 文件名含 pid**：`<stem>.tmp.<pid>`；Task 15 须加 fs2 实例锁（`.rgc/lock` `try_lock_exclusive`，冲突 → `bail!("another rgc instance is running")`）作为多进程根防。
+5. **Task 12 `run_chain` 零推进守卫**：单次 fetch 新增 0 字节且浅边界未消失 → 返回可重试错误（计入 attempts 预算），防止空 pack 死循环。
