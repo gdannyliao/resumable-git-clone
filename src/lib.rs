@@ -1,3 +1,5 @@
+pub mod errors;
+
 #[cfg(test)]
 mod scaffold_tests {
     #[test]
