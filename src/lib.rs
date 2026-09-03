@@ -1,3 +1,4 @@
+pub mod equiv;
 pub mod errors;
 pub mod gitio;
 pub mod jsonio;
