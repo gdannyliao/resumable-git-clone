@@ -1,4 +1,5 @@
 pub mod errors;
+pub mod gitio;
 
 #[cfg(test)]
 mod scaffold_tests {
