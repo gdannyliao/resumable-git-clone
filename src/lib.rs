@@ -1,5 +1,7 @@
 pub mod errors;
 pub mod gitio;
+pub mod jsonio;
+pub mod planner;
 pub mod refs;
 
 #[cfg(test)]
