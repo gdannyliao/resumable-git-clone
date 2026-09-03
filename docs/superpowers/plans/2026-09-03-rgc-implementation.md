@@ -434,7 +434,7 @@ pub fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<GitOutput> {
     };
     if !out.status.success() {
         let msg = format!("git {:?} failed: {}", args, res.stderr.trim_end());
-        return Err(RgcError::from_kind(classify(&res.stderr), msg));
+        return Err(RgcError::from_kind(classify(&res.stderr), msg).into());
     }
     Ok(res)
 }
