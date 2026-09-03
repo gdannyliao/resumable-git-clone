@@ -2354,3 +2354,6 @@ Task 6 落地后的实际 API（commits 92349a5, f5b99fa）：
 6. **wip 中途搬运的物理限制（Task 7 质量审查实证）**：git 禁止从浅仓库搬运——以浅根为目标的 ref 更新被拒（`warning: rejected ... shallow roots are not allowed to be updated`，**exit 0 静默**）。因此 Task 12 `run_chain` 只在链完成（`!is_shallow(piece)`）时调用 `transport_to_main(final_dst=true)`；**中途不做 wip 搬运**（plan 正文"每步立即搬运"的注释作废）。wip 命名空间保留为防御（reconcile 仍清 `refs/rgc/*`），调度器永不写 wip。have 诚实性不变式反而简化：主仓库 ref 只来自完成搬运，永远诚实。
 7. **reconcile 健康门（已落地 cca97ce）**：wipe 范围含 `refs/tags` + `refs/rgc`；擦除后二次 fsck，仍失败 → panic "repository unrecoverable"。
 8. **Task 15 契约**：fs2 实例锁须在 load_plan/reconcile **之前**取得（reconcile 有破坏性 wipe）；`status` 只读，state 缺失/损坏时提示"run resume to rebuild"而**不**调用 reconcile。
+
+9. **Task 8 审查修复已落地（7a5e5a3）**：(a) `transport_to_main` 加 post-fetch `rev-parse --verify` 断言（浅仓搬运静默拒绝转为显式错误）；(b) `stale_shallow_boundary` + `fetch_chain_step` 顶部重置（force-push 悬空边界 → --depth 重取）；(c) `ensure_piece_repo` 含 HEAD symbolic-ref 防护与强化健康探针（绝对 git-dir 一致性 + alternates 校验）。
+10. **Task 12 派发须知**：(a) 分支在克隆中途被远端删除 → "couldn't find remote ref" 目前分类为 Fatal → 会整体失败；Task 12 应在该错误上重查 ls-remote 并标记片为 skipped 而非 failed；(b) 链完成后的远端漂移由 Task 11 catch-up fetch 兜底（`fetch_chain_step` 对已完整分支是 no-op，勿当 catch-up 用）；(c) D/F 冲突远端（feature 与 feature/x 并存）可能导致 `cannot lock ref` → Fatal，Task 11/12 需注意（MVP 文档化为不支持）。
