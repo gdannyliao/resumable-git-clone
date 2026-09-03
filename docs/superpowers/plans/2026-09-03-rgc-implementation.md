@@ -52,6 +52,7 @@ tests/
 - **have 诚实性**：链进行中的增量只进主仓库 `refs/rgc/wip/<branch>`，链完成才写 `refs/remotes/origin/<branch>` 并删 wip——中途 tip ref 一旦被别的片当 have，服务端会按"拥有完整祖先"误判而静默丢历史。
 - **片仓库 refs 复制**：`--shared` 只共享对象不共享 refs，have 协商依据本地 refs，所以初始化后必须把主仓库 `refs/remotes/origin/*`、`refs/tags/*` 复制过来。
 - **write-ahead**：先置 Running 落盘，再执行；Done 只在成功后写。Ctrl-C 不需要信号处理器（子进程随进程组死，Running 在 load 时折返 Pending）。
+- **挂死策略（显式决策）**：`run_git` 层设 `GIT_TERMINAL_PROMPT=0`（杜绝凭据提示挂死）与 `LC_ALL=C`（classify 依赖英文 stderr）。通用 wall-clock 看门狗属调度层增强，MVP 明确不做：worker 挂死即进程挂死，用户 Ctrl-C 后 resume 即兜底（断点状态使其无损）。
 
 ---
 
