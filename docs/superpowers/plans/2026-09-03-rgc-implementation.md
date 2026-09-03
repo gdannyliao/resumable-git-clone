@@ -2361,3 +2361,5 @@ Task 6 落地后的实际 API（commits 92349a5, f5b99fa）：
 11. **Task 9 审查修复已落地（3c86e40）**：tag 批量原语加空批次早返回（防默认 refspec 全量拉取/未出生 HEAD 报错）；transport 断言升级为"存在且等于钉住 OID"；文档注释修正（按 OID fetch 保证确定性而非显式失败，漂移由 Finalizer 兜底）；补 annotated tag 与空批次测试。Task 12 错误分诊：tag 批 `not our ref` / `couldn't find remote ref` → 重查 ls-remote 后标记 skipped（同 A.10a）。
 
 12. **Task 10 审查修复已落地**：equivalent oracle 排除 `refs/remotes/origin/HEAD`（git < 2.48 的 fetch 不创建它，否则所有 e2e 在老 git 上假失败；Task 11 finalize 也可用 `git remote set-head origin --auto` 兜底）；`assert_same_refs` 诊断改为差集+上限 10 条；补对象侧负测试与 origin/HEAD 排除测试；`snapshot()` 文档注明内存规模上限（chromium 级不适用）。对象集与 ref 过滤的口径不对称是**刻意的严格性**（--all 只会多报差异，绝不假通过）。
+
+13. **Task 11 审查修复已落地（5581350）**：catch-up fetch 改 `--force --prune-tags --prune` 且去掉 --quiet（强移 tag 收敛到新 OID、删除 tag 被清理；拒绝原因进错误消息）；verify() 提前到 checkout 之前（失败不留半成品布局）；verify 诊断封顶 10 条；.rgc 清理失败降级为 warning；新增漂移回归测试（强移收敛/删除清理/新增分支收入/keep_state）。注意：`rgc::finalizer::finalize`（模块名按计划，曾短暂叫 finalize.rs 已改名）。
