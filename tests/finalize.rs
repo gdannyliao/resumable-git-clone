@@ -26,7 +26,7 @@ fn finalize_produces_standard_layout() {
 /// 构造一个"已搬运完 refs 的主仓库 + 计划"的公共骨架
 fn setup_finalizable(
     td: &std::path::Path,
-    origin: &std::path::Path,
+    _origin: &std::path::Path,
     url: &str,
 ) -> (std::path::PathBuf, rgc::planner::Plan) {
     let main = td.join("repo");

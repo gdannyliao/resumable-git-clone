@@ -9,10 +9,3 @@ pub mod refs;
 pub mod scheduler;
 pub mod state;
 
-#[cfg(test)]
-mod scaffold_tests {
-    #[test]
-    fn it_builds() {
-        assert!(true);
-    }
-}

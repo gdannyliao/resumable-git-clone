@@ -105,7 +105,7 @@ pub fn clone_flow(url: &str, dest: &Path, opts: &CloneOptions) -> Result<()> {
     };
     let url = url_owned.as_str();
     // A.8：实例锁必须先于 load_plan/reconcile
-    let _lock = acquire_instance_lock(&dest)?;
+    let _lock = acquire_instance_lock(dest)?;
     match load_plan(dest)? {
         Some(plan) => {
             if plan.url != url {
@@ -168,7 +168,7 @@ fn ensure_dest_vacant_for_fresh(dest: &Path) -> Result<()> {
 pub fn resume_flow(dest: &Path, opts: &CloneOptions) -> Result<()> {
     let dest = crate::gitio::absolute_path(dest);
     let dest = dest.as_path();
-    let _lock = acquire_instance_lock(&dest)?;
+    let _lock = acquire_instance_lock(dest)?;
     let plan = load_plan(dest)?.ok_or_else(|| anyhow!("no .rgc/plan.json in {} — nothing to resume", dest.display()))?;
     eprintln!("rgc: resuming {}", dest.display());
     run_and_finalize(&plan, dest, opts)

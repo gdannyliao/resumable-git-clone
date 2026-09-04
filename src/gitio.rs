@@ -122,6 +122,13 @@ pub fn ensure_piece_repo(main: &Path, piece: &Path, url: &str) -> Result<()> {
         if piece_repo_healthy(main, piece) {
             // 同下：HEAD 不得指在待 fetch 的分支上（幂等修复旧片）
             run_git(&["symbolic-ref", "HEAD", "refs/rgc/piece-head"], Some(piece))?;
+            // kill -9 韧性：rgc 被杀时在途的 git 子进程（clone --shared 等）会被
+            // init 收养并跑完 —— 片仓库可能停在"origin 仍指克隆源（主仓库）"的
+            // 中间态（clone 的 origin=源路径，要等随后的 set-url 才指向真远端）。
+            // 健康路径同样幂等收敛 origin 与 gc 配置，否则 resume 会对着主仓库
+            // fetch → "couldn't find remote ref"（kill9 测试实测）。
+            run_git(&["remote", "set-url", "origin", url], Some(piece))?;
+            run_git(&["config", "gc.auto", "0"], Some(piece))?;
             return Ok(());
         }
         std::fs::remove_dir_all(piece)?; // 损坏 → 重建
