@@ -124,8 +124,8 @@ fn rate_limit_storm_bails_run() {
     );
 }
 
-/// 真并行证明：fetch 钩子自带 200ms 真睡并统计并发峰值 —— jobs=3 时峰值必须 >1
-/// （串行执行峰值恒为 1）；200ms 窗口远宽于锁内认领的微秒级开销，断言余量充足。
+/// 真并行证明：fetch 钩子自带 500ms 真睡并统计并发峰值 —— jobs=3 时峰值必须 >1
+/// （串行执行峰值恒为 1）；500ms 窗口给 CI 线程启动抖动留足余量。
 #[test]
 fn concurrency_actually_parallel() {
     let origin = build_origin(30, &[("dev", 15)], &[("v1", 5), ("v2", 10), ("v3", 20)]);
@@ -140,7 +140,7 @@ fn concurrency_actually_parallel() {
         Arc::new(move |real: &dyn Fn() -> anyhow::Result<()>| {
             let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(500));
             let r = real();
             cur.fetch_sub(1, Ordering::SeqCst);
             r
@@ -197,4 +197,44 @@ fn cooldown_wait_loops_until_past_and_keeps_precision() {
     let rest = &waits[1..];
     assert!(!rest.is_empty() && rest.windows(2).all(|w| w[0] > w[1]), "再布防后的等待必须随剩余时间严格递减（每轮重读），got {:?}", rest);
     assert!(rest.iter().all(|w| *w < Duration::from_secs(3)), "重读后的每轮只睡剩余量（不得重复整段 60s），got {:?}", rest);
+}
+
+/// 闸门回归（审查 C1）：风暴落在软/硬阈值窗口内且随后消退时，被减半闸门
+/// 滞留的 worker 必须在 Pending 清空后放行退出 —— 否则活跃 worker 清完片后
+/// run() 在 join 处永久挂死。3 片 + jobs=2 + soft_cap=5 + 注入 6 次 429：
+/// 保证有 worker 在闸门合上后回头认领。修复前此测试挂死（超时即 RED）。
+#[test]
+fn gate_parked_worker_exits_when_work_drains() {
+    let origin = build_origin(8, &[("dev", 8)], &[("v1", 4)]);
+    let url = origin.to_str().unwrap();
+    let plan = build_plan(url, &ls_remote(url).unwrap(), &PlannerConfig::default()).unwrap();
+    assert_eq!(plan.pieces.len(), 3, "1 main chain + 1 dev chain + 1 tag batch");
+    let remaining = Arc::new(Mutex::new(6usize)); // 前 6 次 fetch 返回 429（> soft_cap 5）
+    let fetch: FetchHook = {
+        let remaining = remaining.clone();
+        Arc::new(move |real: &dyn Fn() -> anyhow::Result<()>| {
+            let n = {
+                let mut g = remaining.lock().unwrap();
+                if *g > 0 {
+                    *g -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if n {
+                Err(rgc::errors::RgcError::RateLimited("HTTP 429".into()).into())
+            } else {
+                real()
+            }
+        })
+    };
+    let cfg = SchedulerConfig { jobs: 2, rate_limit_soft_cap: 5, cooldown_secs: 1, fetch, sleep: no_sleep(), ..Default::default() };
+    let td = tempfile::tempdir().unwrap();
+    let main = td.path().join("repo");
+    // 修复前：6 个 429 把 total 推过 soft_cap → 一名 worker 被闸滞留，
+    // 另一名清完 3 片后退出，run() 在 join 处挂死。修复后：Pending 清空即放行。
+    run(&plan, &main, &cfg).unwrap();
+    let st = State::load(&main).unwrap().unwrap();
+    assert!(st.pieces.iter().all(|p| p.status == PieceStatus::Done), "got {:?}", st.pieces);
 }

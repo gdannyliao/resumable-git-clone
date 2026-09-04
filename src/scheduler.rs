@@ -53,6 +53,8 @@ pub struct SchedulerConfig {
     /// A.15a：并发减半软阈值 —— 总 429 超过后，新片认领按一半并行进行
     ///（effective_jobs 减半并保持到 run 结束；计数只增不减）。
     pub rate_limit_soft_cap: u32,
+    /// 限流/拥塞后的全局冷却时长（秒）。默认 [`COOLDOWN_SECS`]；测试可调小。
+    pub cooldown_secs: u64,
     pub target_secs: f64,
     /// 全局冷却时刻：限流/拥塞后，后续片一律推迟到此之后（spec §4.4）
     pub cooldown: Arc<Mutex<Instant>>,
@@ -70,6 +72,7 @@ impl Default for SchedulerConfig {
             jobs: 2,
             rate_limit_breaker: 40,
             rate_limit_soft_cap: 10,
+            cooldown_secs: COOLDOWN_SECS,
             target_secs: 600.0,
             cooldown: Arc::new(Mutex::new(Instant::now())),
             fetch: Arc::new(|real: &dyn Fn() -> Result<()>| real()),
@@ -220,7 +223,7 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
             .collect();
         handles
             .into_iter()
-            .flat_map(|h| h.join().unwrap_or_else(|_| Vec::new()))
+            .flat_map(|h| h.join().unwrap_or_else(|_| vec!["<worker panicked>".to_string()]))
             .collect()
     });
     // A.15a：断路器优先 —— 全局 429 超阈值时整个 run 立即放弃
@@ -268,7 +271,7 @@ fn worker(plan: &Plan, main: &Path, st: &Arc<Mutex<State>>, cfg: &SchedulerConfi
             break;
         }
         // A.15a 并发减半闸门：总 429 超过软阈值后，仅前一半 worker 认领新片
-        wait_for_gate(shared, worker_idx);
+        wait_for_gate(shared, st, worker_idx);
         if shared.tripped() {
             break;
         }
@@ -366,6 +369,7 @@ fn cooldown_jitter(worker_idx: usize) -> Duration {
 /// 断路器触发即提前返回（放弃在即，别把 run 拖过冷却）。
 fn wait_out_cooldown(cfg: &SchedulerConfig, shared: &RunShared, worker_idx: usize) {
     let jitter = cooldown_jitter(worker_idx);
+    let mut logged = false; // 每次布防 episode 只记一次（no-op sleep 钩子下循环会热转，逐圈打日志会刷屏）
     while !shared.tripped() {
         let wait = cfg
             .cooldown
@@ -375,18 +379,23 @@ fn wait_out_cooldown(cfg: &SchedulerConfig, shared: &RunShared, worker_idx: usiz
         if wait.is_zero() {
             return;
         }
-        eprintln!("rgc: worker {worker_idx}: global cooldown, sleeping {wait:?} (+{jitter:?} jitter) before next piece");
+        if !logged {
+            eprintln!("rgc: worker {worker_idx}: global cooldown, sleeping {wait:?} (+{jitter:?} jitter) before next piece");
+            logged = true;
+        }
         (cfg.sleep)(wait + jitter);
     }
 }
 
 /// A.15a：并发减半闸门 —— 总 429 超过软阈值后 effective_jobs 减半，序号不在
 /// 前一半的 worker 在此让路（真实短睡轮询；属调度原语而非退避，不走 sleep
-/// 缝隙以免测试中把"等待"误记为"退避"），直到并行度恢复或断路器触发。
+/// 缝隙以免测试中把"等待"误记为"退避"）。退出条件除断路器外还有
+/// **无 Pending 片**：风暴消退（计数停在软/硬阈值之间）时 halving 永不恢复，
+/// 若只等恢复，被闸 worker 会在活跃 worker 清完所有片后永远滞留 → run 挂死。
 /// configured_jobs == 1 时减半仍为 1，闸门天然失效（不会饿死单 worker）。
-fn wait_for_gate(shared: &RunShared, worker_idx: usize) {
+fn wait_for_gate(shared: &RunShared, st: &Arc<Mutex<State>>, worker_idx: usize) {
     while worker_idx >= shared.effective_jobs.load(Ordering::Relaxed) {
-        if shared.tripped() {
+        if shared.tripped() || !has_pending(st) {
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -418,6 +427,9 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
         match res {
             Ok(()) => {
                 ps.status = PieceStatus::Done;
+                // A.16 不变量：Done 片的 rate_limits 持久化为 0（链片在成功步
+                // 已重置；此处兜底 tag 片——run_tags 无逐步重试点）。
+                ps.rate_limits = 0;
                 return Ok(());
             }
             Err(e) => {
@@ -426,7 +438,7 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
                 // 即便片随后重试成功，后续片也应推迟（原逻辑只看片终态，
                 // 会漏布防"中间限流但最终成功"的情形）。
                 if matches!(kind, FailureKind::RateLimited | FailureKind::Congestion) {
-                    *cfg.cooldown.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now() + Duration::from_secs(COOLDOWN_SECS);
+                    *cfg.cooldown.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now() + Duration::from_secs(cfg.cooldown_secs);
                 }
                 if kind == FailureKind::RateLimited {
                     ps.rate_limits += 1;
