@@ -1,12 +1,21 @@
 use crate::errors::{classify, RgcError};
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug)]
 pub struct GitOutput {
     pub stdout: String,
     pub stderr: String,
+}
+
+/// git argv 里的仓库路径参数必须绝对化：git 按"自身 cwd"解析相对路径，
+/// 而 run_git 的 cwd 常是另一个仓库（main/piece 互为搬运两端）——相对 dest
+/// 会解析出嵌套错误路径（`origin/origin/.rgc/...`），transport 永远失败，
+/// 重试退避把一次可诊断的失败伪装成挂死。`std::path::absolute` 纯词法规范化
+/// （不要求路径存在、不解析 symlink），失败时原样返回（网络式 URL 不受影响）。
+pub fn absolute_path(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// 运行 git 子进程；非零退出按 stderr 分类映射为 RgcError。
@@ -118,8 +127,9 @@ pub fn ensure_piece_repo(main: &Path, piece: &Path, url: &str) -> Result<()> {
         std::fs::remove_dir_all(piece)?; // 损坏 → 重建
     }
     std::fs::create_dir_all(piece)?;
-    let main_s = main.to_string_lossy().into_owned();
-    let piece_s = piece.to_string_lossy().into_owned();
+    // clone 以进程 cwd 执行、fetch 以 piece 为 cwd —— 两处都必须拿到绝对路径
+    let main_s = absolute_path(main).to_string_lossy().into_owned();
+    let piece_s = absolute_path(piece).to_string_lossy().into_owned();
     if main_has_refs(main) {
         run_git(&["clone", "--shared", "--no-checkout", "--quiet", &main_s, &piece_s], None)?;
     } else {
@@ -229,7 +239,9 @@ pub fn fetch_chain_step(piece: &Path, full_ref: &str, short: &str, step: u32, de
 pub fn transport_to_main(main: &Path, piece: &Path, full_ref: &str, short: &str, final_dst: bool) -> Result<()> {
     let dst = if final_dst { format!("refs/remotes/origin/{}", short) } else { format!("refs/rgc/wip/{}", short) };
     let refspec = format!("+{}:{}", full_ref, dst);
-    run_git(&["fetch", "--quiet", piece.to_string_lossy().as_ref(), &refspec], Some(main))?;
+    // fetch 以 main 为 cwd：piece 必须绝对（相对 piece 会被解析成 main/piece 嵌套路径）
+    let piece_arg = absolute_path(piece).to_string_lossy().into_owned();
+    run_git(&["fetch", "--quiet", piece_arg.as_str(), &refspec], Some(main))?;
     // B1: 从浅仓搬运会被 git 静默拒绝（shallow roots 禁更新 → warning + exit 0 静默），必须显式断言目标 ref 已落地（审查 B1）
     run_git(&["rev-parse", "--verify", &dst], Some(main))
         .map_err(|_| anyhow::anyhow!("transport_to_main: ref {} not created (piece 可能仍为浅仓, 或搬运被拒 — shallow roots 禁更新)", dst))?;
@@ -268,7 +280,7 @@ pub fn transport_tags_to_main(main: &Path, piece: &Path, tags: &[crate::refs::Re
     if tags.is_empty() {
         return Ok(()); // 空 refspec 的 fetch 会因 piece 未出生的 HEAD 直接报错
     }
-    let mut args: Vec<String> = vec!["fetch".into(), "--quiet".into(), "--no-tags".into(), piece.to_string_lossy().into_owned()];
+    let mut args: Vec<String> = vec!["fetch".into(), "--quiet".into(), "--no-tags".into(), absolute_path(piece).to_string_lossy().into_owned()];
     for t in tags {
         args.push(format!("+{}:refs/tags/{}", t.oid, t.short_name));
     }
