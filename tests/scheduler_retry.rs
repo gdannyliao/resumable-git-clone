@@ -128,7 +128,9 @@ fn rate_limited_does_not_burn_budget() {
     let st = State::load(&main).unwrap().unwrap();
     assert_eq!(st.pieces[0].status, PieceStatus::Done);
     assert_eq!(st.pieces[0].attempts, 0, "429s must not consume the piece attempt budget (spec §5)");
-    assert_eq!(st.pieces[0].rate_limits, 3, "rate-limits tracked in their own persisted counter");
+    // A.15 顺手项：成功步重置"连续"计数，Done 后持久化值归零；
+    // 限流确曾发生由 calls>=4 证明，计数的持久化由 storm 测试（终态 Failed）覆盖。
+    assert_eq!(st.pieces[0].rate_limits, 0, "successful step resets the consecutive counter");
     assert!(*cfg.cooldown.lock().unwrap() > Instant::now(), "rate-limited fetches must arm the global cooldown");
 }
 
@@ -175,7 +177,10 @@ fn rate_limit_budget_is_rebilled_on_rerun() {
     let st = State::load(&main).unwrap().unwrap();
     assert_eq!(st.pieces[0].status, PieceStatus::Done);
     assert_eq!(st.pieces[0].attempts, 0);
-    assert_eq!(st.pieces[0].rate_limits, 1, "claim-time rebill must reset the stale rate-limit counter");
+    // rebill 的行为证据就是上一行的 run 成功 + calls>=2：若无 claim 时清零，
+    // 陈旧计数(=3) + 首个 429 → 4 > cap(3) 会在第一次限流就放弃。
+    // 持久化 rate_limits 经成功步重置（A.15）归零，不再承载 rebill 证据。
+    assert_eq!(st.pieces[0].rate_limits, 0);
     assert!(*calls.lock().unwrap() >= 2);
 }
 

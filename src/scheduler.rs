@@ -1,4 +1,7 @@
 //! Task 12：串行调度核心 —— write-ahead 状态机驱动的片执行引擎。
+//! Task 14（附录 A.15）：并行化 —— jobs 个 worker 经 `Arc<Mutex<State>>` 共享
+//! 状态（认领/落盘全部锁内完成，保存串行化），配 run 级全局 429 断路器与
+//! 冷却加固（循环重读 + 每 worker 抖动）。
 //!
 //! write-ahead 不变式：片开始执行前，状态先落盘（Pending→Running，崩溃后
 //! `State::load` 把 Running 折返 Pending）；执行结束后再落盘（Done / Failed
@@ -15,6 +18,7 @@ use crate::planner::{halve_step, next_step, Piece, Plan, StepMeasurement};
 use crate::state::{pieces_dir, ChainState, PieceState, PieceStatus, State};
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,8 +27,17 @@ use std::time::{Duration, Instant};
 /// 测试注入：(a) 失败 N 次后调 real()；(b) 恒返回错误；(c) 返回 Ok 但不调
 /// real()（假成功 → 零推进停滞）。无 trait 层级，仅一个配置字段。
 pub type FetchHook = Arc<dyn Fn(&dyn Fn() -> Result<()>) -> Result<()> + Send + Sync>;
-/// 退避/冷却休眠缝隙：默认真实 thread::sleep；测试注入 no-op 使退避瞬时。
-pub type SleepHook = Arc<dyn Fn(u64) + Send + Sync>;
+/// 退避/冷却休眠缝隙：参数为精确 Duration（A.15 顺手项：冷却等待绝不
+/// as_secs 截断）；默认真实 thread::sleep；测试注入 no-op 使退避瞬时。
+pub type SleepHook = Arc<dyn Fn(Duration) + Send + Sync>;
+
+/// A.15：并行 worker 数上限（jobs 钳制 1..=MAX_JOBS —— 误配 0 会得到零
+/// worker 的静默假完成，过大爆线程）。
+pub const MAX_JOBS: usize = 8;
+/// spec §4.4：限流/拥塞后的全局冷却时长（60s 字面量提取为常量，A.15 顺手项）。
+pub const COOLDOWN_SECS: u64 = 60;
+/// A.15b：每 worker 抖动上限（毫秒）——确定性哈希错峰，防 thundering herd。
+pub const COOLDOWN_JITTER_MS_MAX: u64 = 500;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -32,6 +45,14 @@ pub struct SchedulerConfig {
     /// spec §5：限流不计片的重试预算 —— 独立护栏：连续限流超过此上限
     /// （未出现非限流失败即"连续"）才放弃，防 429 风暴死循环。
     pub max_rate_limits: u32,
+    /// A.15：并行 worker 数（run() 钳制到 1..=MAX_JOBS，默认 2）。
+    pub jobs: usize,
+    /// A.15a：run 级总 429 断路器阈值 —— run 全程累计的限流次数一旦超过，
+    /// 整个 run 立即放弃（"upstream rate-limited — rerun later"）。
+    pub rate_limit_breaker: u32,
+    /// A.15a：并发减半软阈值 —— 总 429 超过后，新片认领按一半并行进行
+    ///（effective_jobs 减半并保持到 run 结束；计数只增不减）。
+    pub rate_limit_soft_cap: u32,
     pub target_secs: f64,
     /// 全局冷却时刻：限流/拥塞后，后续片一律推迟到此之后（spec §4.4）
     pub cooldown: Arc<Mutex<Instant>>,
@@ -42,15 +63,24 @@ pub struct SchedulerConfig {
 }
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        // spec §5：默认 5 次；限流独立上限取宽裕的 10 次
+        // spec §5：默认 5 次；限流独立上限取宽裕的 10 次；断路器 40/软阈值 10
         Self {
             max_attempts: 5,
             max_rate_limits: 10,
+            jobs: 2,
+            rate_limit_breaker: 40,
+            rate_limit_soft_cap: 10,
             target_secs: 600.0,
             cooldown: Arc::new(Mutex::new(Instant::now())),
             fetch: Arc::new(|real: &dyn Fn() -> Result<()>| real()),
-            sleep: Arc::new(|secs: u64| std::thread::sleep(Duration::from_secs(secs))),
+            sleep: Arc::new(|d: Duration| std::thread::sleep(d)),
         }
+    }
+}
+impl SchedulerConfig {
+    /// A.15：jobs 钳制（1..=MAX_JOBS）—— 在 run() 入口统一收敛，配置原样保留。
+    pub fn clamped_jobs(&self) -> usize {
+        self.jobs.clamp(1, MAX_JOBS)
     }
 }
 impl std::fmt::Debug for SchedulerConfig {
@@ -59,6 +89,9 @@ impl std::fmt::Debug for SchedulerConfig {
         f.debug_struct("SchedulerConfig")
             .field("max_attempts", &self.max_attempts)
             .field("max_rate_limits", &self.max_rate_limits)
+            .field("jobs", &self.jobs)
+            .field("rate_limit_breaker", &self.rate_limit_breaker)
+            .field("rate_limit_soft_cap", &self.rate_limit_soft_cap)
             .field("target_secs", &self.target_secs)
             .finish_non_exhaustive()
     }
@@ -89,15 +122,72 @@ pub fn decide(attempts: u32, kind: FailureKind, max_attempts: u32) -> Action {
     match kind {
         FailureKind::ShallowUnsupported => Action::RetryNoShallow,
         FailureKind::Fatal => Action::GiveUp,
-        FailureKind::RateLimited => Action::RetryAfter(60u64 << attempts.min(2)),
+        FailureKind::RateLimited => Action::RetryAfter(COOLDOWN_SECS << attempts.min(2)),
         FailureKind::Congestion => Action::RetryAfter(backoff_secs(attempts)),
         FailureKind::Network if attempts >= 2 => Action::HalveAndRetry,
         FailureKind::Network => Action::RetryAfter(backoff_secs(attempts)),
     }
 }
 
-/// 入口：初始化主仓库 → 恢复/对账 state → 串行认领执行全部 Pending 片
+/// A.15 顺手项：风暴退避按连续 429 数升级 —— 60s → 120s → 240s 封顶
+///（附录公式 `60 << rate_limits.min(2)`，以 0 基步数计：第 1 次 429 仍是 60s，
+/// 不回归现有行为）。decide 的决策表不携带"连续限流"计数（429 不计片预算，
+/// attempts 原地踏步），故由 run_piece 在限流分支路由到本函数取退避时长。
+pub fn rate_limit_backoff_secs(consecutive_rate_limits: u32) -> u64 {
+    COOLDOWN_SECS << consecutive_rate_limits.saturating_sub(1).min(2)
+}
+
+/// A.15a：断路器触发后的统一放弃消息（spec 原文）。
+fn breaker_error() -> anyhow::Error {
+    anyhow::anyhow!("upstream rate-limited — rerun later")
+}
+
+/// run 级共享局部（A.15a）：全局 429 断路器 + 并发减半闸门。
+/// 计数只增不减；断路器一经触发不可撤销（rerun 才能以全新配额重来）；
+/// effective_jobs 减半后保持到 run 结束。原子量用 Relaxed 即可：漏看一拍
+/// 最多多认领一片/多睡一拍，无正确性影响（协作式止损与降速）。
+struct RunShared {
+    total_rate_limits: AtomicU32,
+    breaker: AtomicBool,
+    effective_jobs: AtomicUsize,
+    configured_jobs: usize,
+    soft_cap: u32,
+    breaker_threshold: u32,
+}
+impl RunShared {
+    fn new(cfg: &SchedulerConfig) -> Self {
+        RunShared {
+            total_rate_limits: AtomicU32::new(0),
+            breaker: AtomicBool::new(false),
+            effective_jobs: AtomicUsize::new(cfg.clamped_jobs()),
+            configured_jobs: cfg.clamped_jobs(),
+            soft_cap: cfg.rate_limit_soft_cap,
+            breaker_threshold: cfg.rate_limit_breaker,
+        }
+    }
+    fn tripped(&self) -> bool {
+        self.breaker.load(Ordering::Relaxed)
+    }
+    /// 每次限流出现：总计数 +1，越过断路器阈值则触发全局放弃，
+    /// 越过软阈值则把新片认领的并行度减半（A.15a 信号源的另一职能）。
+    fn bump_rate_limit(&self) {
+        let total = self.total_rate_limits.fetch_add(1, Ordering::Relaxed) + 1;
+        if total > self.breaker_threshold {
+            self.breaker.store(true, Ordering::Relaxed);
+        }
+        if total > self.soft_cap {
+            self.effective_jobs.store((self.configured_jobs / 2).max(1), Ordering::Relaxed);
+        }
+    }
+}
+
+/// 入口：初始化主仓库 → 恢复/对账 state → 并行认领执行全部 Pending 片
 /// → 全部 Done 则 Ok（finalize 由调用方执行），否则 Err 列出失败片。
+///
+/// Task 14（A.15c）：state 由 run() 以 `Arc<Mutex<State>>` 持有，jobs 个
+/// worker 共享；全部片状态变更与落盘都在锁内完成（保存天然串行化，
+/// write-ahead 认领协议语义不变）。A.15a：断路器触发时整个 run 立即
+/// 放弃，优先于逐片失败报告。
 pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
     gitio::init_main_repo(main, &plan.url)?;
     let mut st = match State::load(main)? {
@@ -115,13 +205,37 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
         }
     }
     st.save(main)?;
-    let failures = worker(plan, main, &mut st, cfg)?;
-    let failed: Vec<String> = st
-        .pieces
-        .iter()
-        .filter(|p| p.status != PieceStatus::Done)
-        .map(|p| p.id.clone())
-        .collect();
+    let st = Arc::new(Mutex::new(st));
+    let shared = RunShared::new(cfg);
+    // A.15d 前提：worker 经 scope 借用 plan/main/cfg/shared 跨线程运行
+    //（SchedulerConfig 的 Send+Sync 静态断言见 tests/scheduler_parallel.rs），
+    // 免去 Arc<Plan> 克隆。
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        // 引用先行绑定（& 为 Copy）：move 闭包只按值拿引用与 worker_idx，
+        // 不会搬走 Arc/RunShared 本体
+        let st = &st;
+        let shared = &shared;
+        let handles: Vec<_> = (0..shared.configured_jobs)
+            .map(|worker_idx| scope.spawn(move || worker(plan, main, st, cfg, shared, worker_idx)))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|_| Vec::new()))
+            .collect()
+    });
+    // A.15a：断路器优先 —— 全局 429 超阈值时整个 run 立即放弃
+    //（片停在 Running 无妨：rerun 的 load 把 Running 折返 Pending）
+    if shared.tripped() {
+        bail!("{:#}", breaker_error());
+    }
+    let failed: Vec<String> = {
+        let g = st.lock().unwrap_or_else(|p| p.into_inner());
+        g.pieces
+            .iter()
+            .filter(|p| p.status != PieceStatus::Done)
+            .map(|p| p.id.clone())
+            .collect()
+    };
     if !failed.is_empty() {
         // 逐片带上最后错误：调用方不必翻 stderr 就能看到失败原因
         // （限流风暴 → "rate-limited too many times"，停滞 → "zero-progress" 等）
@@ -130,78 +244,174 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
     Ok(())
 }
 
-/// 串行工作循环：认领 → 执行 → 记账，直至无 Pending 片。
+/// 并行工作循环（A.15）：认领 → 执行 → 记账，直至无 Pending 片或断路器触发。
 /// 单片失败不中止整个 run（否则"最后统一列出失败片"就是死代码）：
-/// GiveUp 片落终态 Failed，返回逐片失败明细（id + 最后错误），run 结束统一报告；
-/// rerun 由 run() 折返重试。
-fn worker(plan: &Plan, main: &Path, st: &mut State, cfg: &SchedulerConfig) -> Result<Vec<String>> {
+/// GiveUp 片落终态 Failed，逐片失败明细随 worker 返回，run 结束统一报告；
+/// rerun 由 run() 折返重试。断路器触发则立即收工，由 run() 统一报告。
+fn worker(plan: &Plan, main: &Path, st: &Arc<Mutex<State>>, cfg: &SchedulerConfig, shared: &RunShared, worker_idx: usize) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     loop {
-        let Some(idx) = st.pieces.iter().position(|p| p.status == PieceStatus::Pending) else {
+        if shared.tripped() {
+            break;
+        }
+        // 先看有没有活再等：无片可认领时耗完冷却毫无意义（终局前白睡 60s）。
+        // Pending 集合在单次 run 内只缩不涨（Pending→Running→Done/Failed 单向），
+        // 此处看到空即安全收工；竞态下 claim_piece 返回 None 同样收工。
+        if !has_pending(st) {
+            break;
+        }
+        // 全局冷却：限流/拥塞后，后续片一律推迟（spec §4.4）。A.15b：循环
+        // 重读直到归零（睡眠窗口内可能被其他 worker 的 429 再次推后），
+        // 叠加每 worker 确定性抖动错峰。
+        wait_out_cooldown(cfg, shared, worker_idx);
+        if shared.tripped() {
+            break;
+        }
+        // A.15a 并发减半闸门：总 429 超过软阈值后，仅前一半 worker 认领新片
+        wait_for_gate(shared, worker_idx);
+        if shared.tripped() {
+            break;
+        }
+        let claimed = match claim_piece(main, st, cfg) {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                // 保存失败绝不带伤执行：本 worker 就此收工，run 统一报告
+                eprintln!("rgc: worker {worker_idx}: state save failed — stopping: {e:#}");
+                failures.push(format!("state save failed: {e:#}"));
+                break;
+            }
+        };
+        let Some((idx, id)) = claimed else {
             break;
         };
-        // 全局冷却：限流/拥塞后，后续片一律推迟（spec §4.4）。
-        // 先找活再等：无片可认领时耗完冷却毫无意义（终局前白睡 60s）。
-        let wait = cfg.cooldown.lock().unwrap().saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
-            eprintln!("rgc: global cooldown, sleeping {:?} before next piece", wait);
-            (cfg.sleep)(wait.as_secs());
-        }
-        // write-ahead 认领：Running 先落盘再执行；保存失败绝不带伤执行。
-        // C2：认领时给耗尽预算的片重新计费 —— attempts 只约束单次 run 内的重试，
-        // rerun 给每个片全新预算。（旧位置在 run_piece 里判 `status == Pending`，
-        // 而此处 write-ahead 认领早已置 Running → 条件永假，是死代码。）
-        if st.pieces[idx].attempts > cfg.max_attempts {
-            st.pieces[idx].attempts = 0;
-        }
-        // 限流计数同预算哲学：rerun 认领时清零，风暴后的重跑以全新配额出发
-        //（否则上轮积累到顶的 rate_limits 会让 rerun 一次 429 就立刻放弃）
-        st.pieces[idx].rate_limits = 0;
-        st.pieces[idx].status = PieceStatus::Running;
-        st.save(main)?;
-        let id = st.pieces[idx].id.clone();
-        if let Err(e) = execute_piece(plan, main, st, idx, cfg) {
+        if let Err(e) = execute_piece(plan, main, st, idx, cfg, shared) {
+            // A.15a：全局放弃优先于逐片失败报告
+            if shared.tripped() {
+                break;
+            }
             eprintln!("rgc: piece {} failed this run: {e:#}", id);
             failures.push(format!("{}: {e:#}", id));
         }
     }
-    Ok(failures)
+    failures
 }
 
-fn execute_piece(plan: &Plan, main: &Path, st: &mut State, idx: usize, cfg: &SchedulerConfig) -> Result<()> {
-    // 磁盘预检：按历史最大片字节 × 1.5 估算
-    let max_seen = st.pieces.iter().map(|p| p.bytes).max().unwrap_or(0);
-    let estimate = (max_seen as f64 * 1.5) as u64;
-    if estimate > 0 {
-        if let Ok(avail) = fs2::available_space(main) {
-            if avail < estimate {
-                bail!("disk low: {} bytes available, next piece may need ~{}", avail, estimate);
+/// 锁内快照：是否还有 Pending 片（只为避免无活 worker 白睡冷却）。
+fn has_pending(st: &Arc<Mutex<State>>) -> bool {
+    let g = st.lock().unwrap_or_else(|p| p.into_inner());
+    g.pieces.iter().any(|p| p.status == PieceStatus::Pending)
+}
+
+/// write-ahead 认领（A.15c）：全部状态变更 + 落盘在状态锁内完成（保存天然
+/// 串行化，串行协议语义不变）—— Running 先落盘再执行。
+/// C2：认领时给耗尽预算的片重新计费 —— attempts 只约束单次 run 内的重试，
+/// rerun 给每个片全新预算。（旧位置在 run_piece 里判 `status == Pending`，
+/// 而此处 write-ahead 认领早已置 Running → 条件永假，是死代码。）
+/// 限流计数同预算哲学：rerun 认领时清零，风暴后的重跑以全新配额出发
+///（否则上轮积累到顶的 rate_limits 会让 rerun 一次 429 就立刻放弃）。
+/// 返回 None = 已无 Pending 片。
+fn claim_piece(main: &Path, st: &Arc<Mutex<State>>, cfg: &SchedulerConfig) -> Result<Option<(usize, String)>> {
+    let mut g = st.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(idx) = g.pieces.iter().position(|p| p.status == PieceStatus::Pending) else {
+        return Ok(None);
+    };
+    if g.pieces[idx].attempts > cfg.max_attempts {
+        g.pieces[idx].attempts = 0;
+    }
+    g.pieces[idx].rate_limits = 0;
+    g.pieces[idx].status = PieceStatus::Running;
+    g.save(main)?;
+    Ok(Some((idx, g.pieces[idx].id.clone())))
+}
+
+/// 片执行（A.15c）：预检与结果回写在状态锁内进行；片执行本身（可能数分钟）
+/// 完全不持锁 —— 其他 worker 的认领/落盘不受阻塞。ps 是锁内克隆出的私有
+/// 副本，回写时整体覆盖（片认领后无人再动它的槽位，idx 稳定有效；
+/// 即使本片执行期间他人多次落盘，重放顺序也不影响各片字段的归属）。
+fn execute_piece(plan: &Plan, main: &Path, st: &Arc<Mutex<State>>, idx: usize, cfg: &SchedulerConfig, shared: &RunShared) -> Result<()> {
+    let (piece, mut ps) = {
+        let g = st.lock().unwrap_or_else(|p| p.into_inner());
+        // 磁盘预检：按历史最大片字节 × 1.5 估算
+        let max_seen = g.pieces.iter().map(|p| p.bytes).max().unwrap_or(0);
+        let estimate = (max_seen as f64 * 1.5) as u64;
+        if estimate > 0 {
+            if let Ok(avail) = fs2::available_space(main) {
+                if avail < estimate {
+                    bail!("disk low: {} bytes available, next piece may need ~{}", avail, estimate);
+                }
             }
         }
-    }
-    let piece = plan.pieces[idx].clone();
+        (plan.pieces[idx].clone(), g.pieces[idx].clone())
+    };
     let piece_path: PathBuf = pieces_dir(main).join(piece.piece_dir_name());
-    let mut ps = st.pieces[idx].clone();
-    let res = run_piece(&piece, plan, main, &piece_path, &mut ps, cfg);
-    st.pieces[idx] = ps;
-    st.save(main)?;
+    let res = run_piece(&piece, plan, main, &piece_path, &mut ps, cfg, shared);
+    {
+        let mut g = st.lock().unwrap_or_else(|p| p.into_inner());
+        g.pieces[idx] = ps;
+        g.save(main)?;
+    }
     // 全局冷却布防在 run_piece 内逐次进行（限流/拥塞的每次出现，spec §4.4）
     res
+}
+
+/// A.15b：每 worker 确定性抖动（哈希 worker 序号，0..=500ms）——避免冷却
+/// 到点后全部 worker 同一瞬间扑向上游（thundering herd）。
+fn cooldown_jitter(worker_idx: usize) -> Duration {
+    Duration::from_millis((worker_idx as u64).wrapping_mul(137).wrapping_add(61) % (COOLDOWN_JITTER_MS_MAX + 1))
+}
+
+/// A.15b：冷却等待循环 —— 读冷却 → 睡（精确 Duration，绝不 as_secs 截断，
+/// 叠加 worker 抖动）→ 醒来重读 → 直到归零。睡眠窗口内冷却可能被其他
+/// worker 的 429/拥塞再次推后，一次性睡眠会带着未过期的冷却放行下一片。
+/// 断路器触发即提前返回（放弃在即，别把 run 拖过冷却）。
+fn wait_out_cooldown(cfg: &SchedulerConfig, shared: &RunShared, worker_idx: usize) {
+    let jitter = cooldown_jitter(worker_idx);
+    while !shared.tripped() {
+        let wait = cfg
+            .cooldown
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return;
+        }
+        eprintln!("rgc: worker {worker_idx}: global cooldown, sleeping {wait:?} (+{jitter:?} jitter) before next piece");
+        (cfg.sleep)(wait + jitter);
+    }
+}
+
+/// A.15a：并发减半闸门 —— 总 429 超过软阈值后 effective_jobs 减半，序号不在
+/// 前一半的 worker 在此让路（真实短睡轮询；属调度原语而非退避，不走 sleep
+/// 缝隙以免测试中把"等待"误记为"退避"），直到并行度恢复或断路器触发。
+/// configured_jobs == 1 时减半仍为 1，闸门天然失效（不会饿死单 worker）。
+fn wait_for_gate(shared: &RunShared, worker_idx: usize) {
+    while worker_idx >= shared.effective_jobs.load(Ordering::Relaxed) {
+        if shared.tripped() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// 片执行 + 重试循环。错误计预算（attempts++），按 decide 分诊：
 /// GiveUp 落终态 Failed（片已定局：本轮不再碰它，rerun 由 run() 折返重试）。
 /// spec §5 例外：429/限流/滥用检测不计入片的重试次数 —— attempts 原地踏步，
 /// 连续限流次数独立记账（非限流失败即复位），超过 max_rate_limits 才放弃。
-fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mut PieceState, cfg: &SchedulerConfig) -> Result<()> {
+/// A.15a：每次限流同时计入 run 级总计数 —— 越过断路器阈值即整个 run 立即
+/// 放弃（不再退避重试），越过软阈值则新片认领并行度减半。
+fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mut PieceState, cfg: &SchedulerConfig, shared: &RunShared) -> Result<()> {
     loop {
+        // A.15a：断路器已触发 → 立即止损（退避睡眠醒来后第一时间退出）
+        if shared.tripped() {
+            return Err(breaker_error());
+        }
         let res = match piece {
             Piece::Chain { .. } => {
                 let chain = ps
                     .chain
                     .clone()
                     .unwrap_or(ChainState { depth_done: 0, step: plan.initial_step, no_shallow: false });
-                run_chain(piece, plan, main, ps, chain, cfg)
+                run_chain(piece, plan, main, ps, chain, cfg, shared)
             }
             Piece::TagBatch { tags } => run_tags(plan, main, piece_path, tags, ps, cfg),
         };
@@ -216,10 +426,12 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
                 // 即便片随后重试成功，后续片也应推迟（原逻辑只看片终态，
                 // 会漏布防"中间限流但最终成功"的情形）。
                 if matches!(kind, FailureKind::RateLimited | FailureKind::Congestion) {
-                    *cfg.cooldown.lock().unwrap() = Instant::now() + Duration::from_secs(60);
+                    *cfg.cooldown.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now() + Duration::from_secs(COOLDOWN_SECS);
                 }
                 if kind == FailureKind::RateLimited {
                     ps.rate_limits += 1;
+                    // A.15a：run 级总 429 计数 —— 断路器 + 并发减半的信号源
+                    shared.bump_rate_limit();
                     if ps.rate_limits > cfg.max_rate_limits {
                         // 不计预算 ≠ 无限重试：429 风暴到此为止
                         ps.status = PieceStatus::Failed;
@@ -230,6 +442,11 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
                             cfg.max_rate_limits
                         ));
                     }
+                    // A.15a：总 429 刚越过断路器阈值 → 立即放弃整个 run，
+                    // 不再退避重试（先于 decide，绝不把 run 拖过一次长退避）
+                    if shared.tripped() {
+                        return Err(breaker_error());
+                    }
                     match decide(ps.attempts, kind, cfg.max_attempts) {
                         // attempts 未动 → 这里的 GiveUp 只在预算已被其他失败
                         // 耗尽的边界触发（限流不会把片推入 GiveUp）
@@ -237,7 +454,10 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
                             ps.status = PieceStatus::Failed;
                             return Err(e);
                         }
-                        Action::RetryAfter(secs) => (cfg.sleep)(secs),
+                        // 退避时长按"连续限流数"升级（A.15 顺手项）：60→120→240
+                        // 封顶；decide 只给出 RetryAfter 类别，时长不取自
+                        // attempts（429 不计预算，attempts 在风暴中原地踏步）
+                        Action::RetryAfter(_) => (cfg.sleep)(Duration::from_secs(rate_limit_backoff_secs(ps.rate_limits))),
                         _ => {} // 限流的决策只会是长退避/放弃，防御性 no-op
                     }
                 } else {
@@ -262,9 +482,9 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
                             if let Some(c) = &mut ps.chain {
                                 c.step = halve_step(c.step);
                             }
-                            (cfg.sleep)(backoff_secs(ps.attempts));
+                            (cfg.sleep)(Duration::from_secs(backoff_secs(ps.attempts)));
                         }
-                        Action::RetryAfter(secs) => (cfg.sleep)(secs),
+                        Action::RetryAfter(secs) => (cfg.sleep)(Duration::from_secs(secs)),
                     }
                 }
             }
@@ -276,7 +496,7 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
 /// 附录 A.6：git 禁止从浅仓搬运（shallow roots 禁更新，exit 0 静默）——
 /// 只在链完成后调用一次 transport_to_main(final_dst=true)，中途不做 wip 搬运
 /// （plan 正文"每步立即搬运"的注释作废；B1 断言在 transport_to_main 内，A.9）。
-fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain: ChainState, cfg: &SchedulerConfig) -> Result<()> {
+fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain: ChainState, cfg: &SchedulerConfig, shared: &RunShared) -> Result<()> {
     let Piece::Chain { full_ref, short_name: short } = piece else {
         bail!("run_chain on non-chain piece {}", piece.id());
     };
@@ -297,6 +517,10 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
             ))
             .into());
         }
+        // A.15a：断路器已触发 → 不再发起新一步 fetch（run 由 run_piece 收口）
+        if shared.tripped() {
+            return Err(breaker_error());
+        }
         let (b0, c0) = gitio::repo_stats(&piece_path, short)?;
         let t0 = Instant::now();
         // TODO(A.10a): 远端在克隆中途删分支 → "couldn't find remote ref" 目前分类
@@ -305,6 +529,8 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
         // 测试缝隙：fetch 经 cfg.fetch 包装（默认直通；见 FetchHook）。
         let real = || gitio::fetch_chain_step(&piece_path, full_ref, short, step, depth_done, chain.no_shallow);
         (cfg.fetch)(&real)?;
+        // A.15 顺手项：成功步打断"连续限流"计数（连续性以成功/其他失败为界）
+        ps.rate_limits = 0;
         let secs = t0.elapsed().as_secs_f64();
         let (b1, c1) = gitio::repo_stats(&piece_path, short)?;
         depth_done = c1;
