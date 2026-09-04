@@ -231,3 +231,33 @@ fn status_read_only() {
     // load_plan 对完好 plan 仍可读（sanity：上面的 status 走的是真 plan）
     assert!(load_plan(&dest).unwrap().is_some());
 }
+
+/// 全新 dest 预检（审查 I1）：非空目录 / 既有 git 仓库必须在任何下载之前拒绝 ——
+/// 否则 finalize 的 checkout -B 会孤儿化既有提交、静默改写 origin url。
+#[test]
+fn fresh_clone_rejects_nonempty_dest() {
+    let origin = build_origin(8, &[], &[]);
+    let url = origin.to_str().unwrap();
+    let td = tempfile::tempdir().unwrap();
+    // 情形 1：外来非空目录
+    let dest = td.path().join("occupied");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("user-file.txt"), "precious").unwrap();
+    let err = clone_flow(url, &dest, &CloneOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("not empty"), "unexpected: {err:#}");
+    assert!(err.to_string().contains("user-file.txt"), "message must name the offending entries: {err:#}");
+    assert!(!plan_path(&dest).exists(), "预检必须先于 ls_remote/规划（坏 URL 也轮不到）");
+    // 情形 2：既有 git 仓库（含独立提交与另一 origin）
+    let dest2 = td.path().join("existing-repo");
+    git(td.path(), &["init", "--quiet", "-b", "main", dest2.to_str().unwrap()]);
+    git(&dest2, &["config", "user.email", "t@t"]);
+    git(&dest2, &["config", "user.name", "t"]);
+    std::fs::write(dest2.join("theirs.txt"), "x").unwrap();
+    git(&dest2, &["add", "."]);
+    git(&dest2, &["commit", "--quiet", "-m", "theirs"]);
+    let err2 = clone_flow(url, &dest2, &CloneOptions::default()).unwrap_err();
+    assert!(err2.to_string().contains("not empty"), "unexpected: {err2:#}");
+    let head = rgc::gitio::run_git(&["rev-parse", "HEAD"], Some(&dest2)).unwrap();
+    let theirs = rgc::gitio::run_git(&["rev-parse", "main"], Some(&dest2)).unwrap();
+    assert_eq!(head.stdout.trim(), theirs.stdout.trim(), "既有仓库的 main 不得被动过");
+}

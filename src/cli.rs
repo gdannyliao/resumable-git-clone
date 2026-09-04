@@ -130,6 +130,7 @@ pub fn clone_flow(url: &str, dest: &Path, opts: &CloneOptions) -> Result<()> {
                 );
             }
             eprintln!("rgc: planning {} → {}", url, dest.display());
+            ensure_dest_vacant_for_fresh(dest)?;
             let remote = ls_remote(url)?;
             let plan = build_plan(url, &remote, &PlannerConfig { initial_step: opts.initial_step, ..Default::default() })?;
             save_plan(dest, &plan)?;
@@ -137,6 +138,30 @@ pub fn clone_flow(url: &str, dest: &Path, opts: &CloneOptions) -> Result<()> {
             run_and_finalize(&plan, dest, opts)
         }
     }
+}
+
+/// 全新 dest 的预检：已存在的 dest 只允许含 `.rgc` 骨架（实例锁所在，孤儿
+/// plan/state 已在上一步拦截）。真实 `git clone` 拒绝非空 dest —— rgc 同样拒绝，
+/// 否则 finalize 的 `checkout -B` 会孤儿化既有仓库的本地提交、静默改写 origin
+/// url，或下载数小时后才在非空目录的 checkout 冲突上失败。
+fn ensure_dest_vacant_for_fresh(dest: &Path) -> Result<()> {
+    if !dest.exists() {
+        return Ok(());
+    }
+    let foreign: Vec<_> = std::fs::read_dir(dest)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|n| n != ".rgc")
+        .collect();
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = foreign.iter().map(|n| n.to_string_lossy().into_owned()).collect();
+    bail!(
+        "destination {} is not empty (contains {}) — rgc only clones into an empty directory; choose a new destination or delete its contents",
+        dest.display(),
+        names.join(", ")
+    );
 }
 
 /// `rgc resume <dir>`：显式恢复；无 plan 即报错。
@@ -173,6 +198,9 @@ pub fn status(dir: &Path) -> Result<()> {
     println!("plan: {} ({} pieces)", plan.url, plan.pieces.len());
     match State::load(dir)? {
         Some(state) => {
+            if state.fingerprint != plan.fingerprint() {
+                eprintln!("warning: state.json does not match plan.json in {} — display may be misleading", dir.display());
+            }
             for ps in &state.pieces {
                 let extra = match &ps.chain {
                     Some(c) => format!("  depth={} step={}", c.depth_done, c.step),
