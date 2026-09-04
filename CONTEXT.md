@@ -28,7 +28,7 @@ _Avoid_: 临时仓库、缓存仓库
 `plan.json` 记录片集合；指纹是 url + 有序片 id 的 FNV-1a 哈希，state.json 携带之，不匹配 = 大声报错，绝不静默重规划。
 
 **台账（State / Ledger）**:
-`state.json`，断点唯一真相源；write-ahead——先落盘 Running 再执行。任何故障的恢复路径都收敛到"重读台账、继续调度"。
+`state.json`，断点唯一真相源；write-ahead——先落盘 Running 再执行。任何故障的恢复路径都收敛到"重读台账、继续调度"。代码上分为 state.rs（数据 + 序列化 + 崩溃折返 + 对账）与 ledger.rs（Ledger module：write-ahead 协议的 mutating interface——open / claim / snapshot / complete）。只读路径（status）走 State::load，不走 Ledger。
 _Avoid_: 进度文件、检查点
 
 **认领（Claim）**:

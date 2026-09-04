@@ -175,14 +175,9 @@ pub fn resume_flow(dest: &Path, opts: &CloneOptions) -> Result<()> {
 }
 
 /// 调度 + 收尾（clone/resume 共用尾部）。
+/// 指纹守卫单点在 Ledger::open（scheduler::run 内）：init_main_repo 幂等
+/// 先行（reconcile 的 fsck 需要合法仓库），mismatch 依旧大声报错。
 fn run_and_finalize(plan: &Plan, dest: &Path, opts: &CloneOptions) -> Result<()> {
-    // A.2（Task 15 份内的指纹守卫）：先于任何 git 变更大声报错
-    //（scheduler::run 内部还有一道，此处提前到 init_main_repo 之前）。
-    if let Some(st) = State::load(dest)? {
-        if st.fingerprint != plan.fingerprint() {
-            bail!("plan/state mismatch — delete .rgc/ or restore plan.json");
-        }
-    }
     let cfg = SchedulerConfig { jobs: opts.jobs, target_secs: opts.piece_target, ..Default::default() };
     eprintln!("rgc: fetching {} pieces with {} jobs (piece target {}s)", plan.pieces.len(), cfg.clamped_jobs(), opts.piece_target);
     scheduler::run(plan, dest, &cfg)?;

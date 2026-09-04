@@ -7,6 +7,7 @@ pub mod cli;
 pub mod finalizer;
 pub mod gitio;
 pub mod jsonio;
+pub mod ledger;
 pub mod planner;
 pub mod refs;
 pub mod scheduler;

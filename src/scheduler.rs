@@ -16,12 +16,13 @@
 
 use crate::errors::{kind_of, FailureKind, RgcError};
 use crate::gitio;
+use crate::ledger::Ledger;
 use crate::planner::{halve_step, next_step, Piece, Plan, StepMeasurement};
-use crate::state::{pieces_dir, ChainState, PieceState, PieceStatus, State};
+use crate::state::{pieces_dir, ChainState, PieceState, PieceStatus};
 use crate::throttle::Throttle;
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // —— 测试缝隙（附录 A.14 / Task 12 审查 I2）——
@@ -135,44 +136,30 @@ pub fn decide(attempts: u32, kind: FailureKind, max_attempts: u32) -> Option<Act
     })
 }
 
-/// 入口：初始化主仓库 → 恢复/对账 state → 并行认领执行全部 Pending 片
-/// → 全部 Done 则 Ok（finalize 由调用方执行），否则 Err 列出失败片。
+/// 入口：初始化主仓库 → [`Ledger::open`]（载入/指纹守卫/对账/折返/首落盘）
+/// → 并行认领执行全部 Pending 片 → 全部 Done 则 Ok（finalize 由调用方执行），
+/// 否则 Err 列出失败片。
 ///
-/// Task 14（A.15c）：state 由 run() 以 `Arc<Mutex<State>>` 持有，jobs 个
-/// worker 共享；全部片状态变更与落盘都在锁内完成（保存天然串行化，
+/// Task 14（A.15c）：台账由 Ledger 以 `Arc<Mutex<State>>` 持有，jobs 个
+/// worker 共享；全部片状态变更与落盘都在 Ledger 锁内完成（保存天然串行化，
 /// write-ahead 认领协议语义不变）。A.15a：断路器触发时整个 run 立即
 /// 放弃，优先于逐片失败报告。
 pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
     gitio::init_main_repo(main, &plan.url)?;
-    let mut st = match State::load(main)? {
-        // A.2：指纹不匹配 = state 来自另一次规划 → 绝不静默重规划
-        Some(s) if s.fingerprint == plan.fingerprint() => s,
-        Some(_) => bail!("plan/state mismatch — delete .rgc/ or restore plan.json"),
-        // state 缺失/损坏（load_json 把损坏视同缺失）→ 对账重建
-        None => crate::state::reconcile(plan, main),
-    };
-    // C1：Failed 是上一轮的终态 —— rerun 折返 Pending 重新出发
-    //（认领时 rebill 给全新预算），终态片不占坑、可重试。
-    for p in &mut st.pieces {
-        if p.status == PieceStatus::Failed {
-            p.status = PieceStatus::Pending;
-        }
-    }
-    st.save(main)?;
-    let st = Arc::new(Mutex::new(st));
+    let ledger = Ledger::open(main, plan)?;
     // 降速器：测试可经 SchedulerConfig::throttle 注入预布防的实例；否则自造
     let throttle = cfg.throttle.clone().unwrap_or_else(|| Throttle::new(cfg));
-    // A.15d 前提：worker 经 scope 借用 plan/main/cfg/throttle 跨线程运行
+    // A.15d 前提：worker 经 scope 借用 plan/main/cfg/ledger/throttle 跨线程运行
     //（SchedulerConfig 的 Send+Sync 静态断言见 tests/scheduler_parallel.rs），
     // 免去 Arc<Plan> 克隆。
     let failures: Vec<String> = std::thread::scope(|scope| {
         // 引用先行绑定（& 为 Copy）：move 闭包只按值拿引用与 worker_idx，
-        // 不会搬走 Arc/Throttle 本体
-        let st = &st;
+        // 不会搬走 Ledger/Throttle 本体
+        let ledger = &ledger;
         let throttle = &throttle;
         let configured_jobs = cfg.clamped_jobs();
         let handles: Vec<_> = (0..configured_jobs)
-            .map(|worker_idx| scope.spawn(move || worker(plan, main, st, cfg, throttle, worker_idx)))
+            .map(|worker_idx| scope.spawn(move || worker(plan, main, ledger, cfg, throttle, worker_idx)))
             .collect();
         handles
             .into_iter()
@@ -184,14 +171,7 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
     if throttle.tripped() {
         bail!("{:#}", throttle.abort_error());
     }
-    let failed: Vec<String> = {
-        let g = st.lock().unwrap_or_else(|p| p.into_inner());
-        g.pieces
-            .iter()
-            .filter(|p| p.status != PieceStatus::Done)
-            .map(|p| p.id.clone())
-            .collect()
-    };
+    let failed = ledger.unfinished_ids();
     if !failed.is_empty() {
         // 逐片带上最后错误：调用方不必翻 stderr 就能看到失败原因
         // （限流风暴 → "rate-limited too many times"，停滞 → "zero-progress" 等）
@@ -203,8 +183,8 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
 /// 并行工作循环（A.15）：认领 → 执行 → 记账，直至无 Pending 片或断路器触发。
 /// 单片失败不中止整个 run（否则"最后统一列出失败片"就是死代码）：
 /// GiveUp 片落终态 Failed，逐片失败明细随 worker 返回，run 结束统一报告；
-/// rerun 由 run() 折返重试。断路器触发则立即收工，由 run() 统一报告。
-fn worker(plan: &Plan, main: &Path, st: &Arc<Mutex<State>>, cfg: &SchedulerConfig, throttle: &Throttle, worker_idx: usize) -> Vec<String> {
+/// rerun 由 Ledger::open 折返重试。断路器触发则立即收工，由 run() 统一报告。
+fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, throttle: &Throttle, worker_idx: usize) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     loop {
         if throttle.tripped() {
@@ -212,18 +192,18 @@ fn worker(plan: &Plan, main: &Path, st: &Arc<Mutex<State>>, cfg: &SchedulerConfi
         }
         // 先看有没有活再等：无片可认领时耗完冷却毫无意义（终局前白睡 60s）。
         // Pending 集合在单次 run 内只缩不涨（Pending→Running→Done/Failed 单向），
-        // 此处看到空即安全收工；竞态下 claim_piece 返回 None 同样收工。
-        if !has_pending(st) {
+        // 此处看到空即安全收工；竞态下 Ledger::claim 返回 None 同样收工。
+        if !ledger.has_pending() {
             break;
         }
         // 认领前的统一等待：全局冷却（循环重读 + 每 worker 抖动，spec §4.4/A.15b）
         // + 并发减半闸门（A.15a；Pending 清空即放行被闸 worker，A.17）——
         // 全部归 Throttle；台账探测以闭包注入，Throttle 保持台账无关。
-        throttle.wait_turn(worker_idx, &|| has_pending(st));
+        throttle.wait_turn(worker_idx, &|| ledger.has_pending());
         if throttle.tripped() {
             break;
         }
-        let claimed = match claim_piece(main, st, cfg) {
+        let claimed = match ledger.claim(cfg.max_attempts) {
             Ok(claimed) => claimed,
             Err(e) => {
                 // 保存失败绝不带伤执行：本 worker 就此收工，run 统一报告
@@ -235,7 +215,7 @@ fn worker(plan: &Plan, main: &Path, st: &Arc<Mutex<State>>, cfg: &SchedulerConfi
         let Some((idx, id)) = claimed else {
             break;
         };
-        if let Err(e) = execute_piece(plan, main, st, idx, cfg, throttle) {
+        if let Err(e) = execute_piece(plan, main, ledger, idx, cfg, throttle) {
             // A.15a：全局放弃优先于逐片失败报告
             if throttle.tripped() {
                 break;
@@ -247,60 +227,25 @@ fn worker(plan: &Plan, main: &Path, st: &Arc<Mutex<State>>, cfg: &SchedulerConfi
     failures
 }
 
-/// 锁内快照：是否还有 Pending 片（只为避免无活 worker 白睡冷却）。
-fn has_pending(st: &Arc<Mutex<State>>) -> bool {
-    let g = st.lock().unwrap_or_else(|p| p.into_inner());
-    g.pieces.iter().any(|p| p.status == PieceStatus::Pending)
-}
-
-/// write-ahead 认领（A.15c）：全部状态变更 + 落盘在状态锁内完成（保存天然
-/// 串行化，串行协议语义不变）—— Running 先落盘再执行。
-/// C2：认领时给耗尽预算的片重新计费 —— attempts 只约束单次 run 内的重试，
-/// rerun 给每个片全新预算。（旧位置在 run_piece 里判 `status == Pending`，
-/// 而此处 write-ahead 认领早已置 Running → 条件永假，是死代码。）
-/// 限流计数同预算哲学：rerun 认领时清零，风暴后的重跑以全新配额出发
-///（否则上轮积累到顶的 rate_limits 会让 rerun 一次 429 就立刻放弃）。
-/// 返回 None = 已无 Pending 片。
-fn claim_piece(main: &Path, st: &Arc<Mutex<State>>, cfg: &SchedulerConfig) -> Result<Option<(usize, String)>> {
-    let mut g = st.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(idx) = g.pieces.iter().position(|p| p.status == PieceStatus::Pending) else {
-        return Ok(None);
-    };
-    if g.pieces[idx].attempts > cfg.max_attempts {
-        g.pieces[idx].attempts = 0;
-    }
-    g.pieces[idx].rate_limits = 0;
-    g.pieces[idx].status = PieceStatus::Running;
-    g.save(main)?;
-    Ok(Some((idx, g.pieces[idx].id.clone())))
-}
-
-/// 片执行（A.15c）：预检与结果回写在状态锁内进行；片执行本身（可能数分钟）
-/// 完全不持锁 —— 其他 worker 的认领/落盘不受阻塞。ps 是锁内克隆出的私有
-/// 副本，回写时整体覆盖（片认领后无人再动它的槽位，idx 稳定有效；
-/// 即使本片执行期间他人多次落盘，重放顺序也不影响各片字段的归属）。
-fn execute_piece(plan: &Plan, main: &Path, st: &Arc<Mutex<State>>, idx: usize, cfg: &SchedulerConfig, throttle: &Throttle) -> Result<()> {
-    let (piece, mut ps) = {
-        let g = st.lock().unwrap_or_else(|p| p.into_inner());
-        // 磁盘预检：按历史最大片字节 × 1.5 估算
-        let max_seen = g.pieces.iter().map(|p| p.bytes).max().unwrap_or(0);
-        let estimate = (max_seen as f64 * 1.5) as u64;
-        if estimate > 0 {
-            if let Ok(avail) = fs2::available_space(main) {
-                if avail < estimate {
-                    bail!("disk low: {} bytes available, next piece may need ~{}", avail, estimate);
-                }
+/// 片执行（A.15c）：预检与结果回写经 Ledger 在状态锁内进行；片执行本身
+/// （可能数分钟）完全不持锁 —— 其他 worker 的认领/落盘不受阻塞。ps 是
+/// Ledger 克隆出的私有副本，完成时整体回写（见 Ledger::snapshot/complete）。
+fn execute_piece(plan: &Plan, main: &Path, ledger: &Ledger, idx: usize, cfg: &SchedulerConfig, throttle: &Throttle) -> Result<()> {
+    let piece = plan.pieces[idx].clone();
+    // 磁盘预检：按历史最大片字节 × 1.5 估算
+    let max_seen = ledger.max_piece_bytes();
+    let estimate = (max_seen as f64 * 1.5) as u64;
+    if estimate > 0 {
+        if let Ok(avail) = fs2::available_space(main) {
+            if avail < estimate {
+                bail!("disk low: {} bytes available, next piece may need ~{}", avail, estimate);
             }
         }
-        (plan.pieces[idx].clone(), g.pieces[idx].clone())
-    };
+    }
+    let mut ps = ledger.snapshot(idx);
     let piece_path: PathBuf = pieces_dir(main).join(piece.piece_dir_name());
     let res = run_piece(&piece, plan, main, &piece_path, &mut ps, cfg, throttle);
-    {
-        let mut g = st.lock().unwrap_or_else(|p| p.into_inner());
-        g.pieces[idx] = ps;
-        g.save(main)?;
-    }
+    ledger.complete(idx, ps)?;
     // 全局冷却布防在 run_piece 内逐次进行（限流/拥塞的每次出现，spec §4.4，
     // 经 Throttle::on_failure）
     res
