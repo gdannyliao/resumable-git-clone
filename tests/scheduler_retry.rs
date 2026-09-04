@@ -13,8 +13,8 @@ use rgc::planner::{build_plan, PlannerConfig};
 use rgc::refs::ls_remote;
 use rgc::scheduler::{run, FetchHook, SchedulerConfig, SleepHook};
 use rgc::state::{PieceStatus, State};
+use rgc::throttle::Throttle;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 /// fetch 缝隙的调用计数（Arc 共享，供断言 fetch 恰好发生 N 次）
 type Calls = Arc<Mutex<usize>>;
@@ -120,7 +120,9 @@ fn rate_limited_does_not_burn_budget() {
     let url = origin.to_str().unwrap();
     let plan = plan_for(url, 20);
     let (fetch, calls) = fail_first_then_real(RgcError::RateLimited("HTTP 429".into()), 3);
-    let cfg = cfg_with(fetch);
+    // 注入预构造的 Throttle：run() 用它而非自造，事后经探针断言冷却确曾布防
+    let throttle = Throttle::new(&cfg_with(fetch.clone()));
+    let cfg = SchedulerConfig { throttle: Some(throttle.clone()), ..cfg_with(fetch) };
     let td = tempfile::tempdir().unwrap();
     let main = td.path().join("repo");
     run(&plan, &main, &cfg).unwrap();
@@ -131,7 +133,7 @@ fn rate_limited_does_not_burn_budget() {
     // A.15 顺手项：成功步重置"连续"计数，Done 后持久化值归零；
     // 限流确曾发生由 calls>=4 证明，计数的持久化由 storm 测试（终态 Failed）覆盖。
     assert_eq!(st.pieces[0].rate_limits, 0, "successful step resets the consecutive counter");
-    assert!(*cfg.cooldown.lock().unwrap() > Instant::now(), "rate-limited fetches must arm the global cooldown");
+    assert!(throttle.is_cooling(), "rate-limited fetches must arm the global cooldown");
 }
 
 /// 429 风暴：限流不计预算 ≠ 无限重试 —— 超过独立限流上限后片 Failed，

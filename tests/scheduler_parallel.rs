@@ -14,11 +14,12 @@ use rgc::equiv::{assert_same_objects, assert_same_refs, snapshot};
 use rgc::finalizer::finalize;
 use rgc::planner::{build_plan, PlannerConfig};
 use rgc::refs::ls_remote;
-use rgc::scheduler::{rate_limit_backoff_secs, run, FetchHook, SchedulerConfig, SleepHook};
+use rgc::scheduler::{run, FetchHook, SchedulerConfig, SleepHook};
 use rgc::state::{PieceStatus, State};
+use rgc::throttle::Throttle;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn no_sleep() -> SleepHook {
     Arc::new(|_| {})
@@ -32,13 +33,14 @@ fn plan_for(url: &str, initial_step: u32) -> rgc::planner::Plan {
 }
 
 /// A.15d：Send+Sync 静态断言 —— worker 以 std::thread::scope 借用 cfg 跨线程，
-/// cfg / 测试缝隙类型一旦失去 Send+Sync，本测试连同整个并行调度编译失败。
+/// cfg / 测试缝隙 / Throttle 一旦失去 Send+Sync，本测试连同整个并行调度编译失败。
 #[test]
 fn send_sync_assert() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SchedulerConfig>();
     assert_send_sync::<FetchHook>();
     assert_send_sync::<SleepHook>();
+    assert_send_sync::<Throttle>();
 }
 
 /// jobs 钳制（1..=8）：误配 0 会得到零 worker（静默假完成），过大爆线程。
@@ -50,13 +52,13 @@ fn jobs_are_clamped() {
 }
 
 /// 顺手项：风暴退避按连续 429 数升级 —— 60s → 120s → 240s 封顶
-/// （附录公式 60<<rate_limits.min(2)，以 0 基步数计）。
+/// （附录公式 60<<min(2)，以 0 基步数计）。策略现归 Throttle 所有。
 #[test]
 fn storm_backoff_escalates_and_caps() {
-    assert_eq!(rate_limit_backoff_secs(1), 60);
-    assert_eq!(rate_limit_backoff_secs(2), 120);
-    assert_eq!(rate_limit_backoff_secs(3), 240);
-    assert_eq!(rate_limit_backoff_secs(99), 240, "escalation caps at 240s");
+    assert_eq!(Throttle::storm_backoff(1), Duration::from_secs(60));
+    assert_eq!(Throttle::storm_backoff(2), Duration::from_secs(120));
+    assert_eq!(Throttle::storm_backoff(3), Duration::from_secs(240));
+    assert_eq!(Throttle::storm_backoff(99), Duration::from_secs(240), "escalation caps at 240s");
 }
 
 /// 并行端到端：jobs=3 真并行跑完 → 全部 Done → finalize → 产物布局与
@@ -159,6 +161,8 @@ fn concurrency_actually_parallel() {
 /// 推进时钟），首次睡眠期间把冷却再布防到 +2s。循环重读的实现会跟着剩余时间
 /// 递减（≥3 条、严格递减、亚秒精确）；一次性 sleep 只记 1 条就带着未来冷却放行。
 /// 有界性：+2s ÷ 200ms/次 ≈ 10 次迭代封顶，绝不挂死。
+/// Throttle 化后：测试经 Option<Throttle> 缝隙注入预布防的降速器（A.14 idiom），
+/// 睡眠钩子持其 clone 在睡眠窗口内再布防。
 #[test]
 fn cooldown_wait_loops_until_past_and_keeps_precision() {
     let origin = build_origin(8, &[], &[("v1", 4)]);
@@ -166,14 +170,14 @@ fn cooldown_wait_loops_until_past_and_keeps_precision() {
     // 2 片（1 链 + 1 tag 批）+ jobs=1：串行认领，全部冷却睡眠可归因
     let plan = build_plan(url, &ls_remote(url).unwrap(), &PlannerConfig::default()).unwrap();
     assert_eq!(plan.pieces.len(), 2);
-    // 冷却 Arc 先于 cfg 构造：睡眠钩子需要在睡眠窗口内再布防
-    let cooldown = Arc::new(Mutex::new(Instant::now()));
-    *cooldown.lock().unwrap() = Instant::now() + Duration::from_secs(60); // 预布防：首片认领前必须消费
+    // 睡眠钩子需要在睡眠窗口内再布防冷却 —— 但它先于 Throttle 构造，
+    // 经 slot 延迟取回 Throttle 句柄
+    let slot: Arc<Mutex<Option<Throttle>>> = Arc::new(Mutex::new(None));
     let re_armed = Arc::new(AtomicBool::new(false));
     let sleep_log: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
     let sleep: SleepHook = {
         let log = sleep_log.clone();
-        let cooldown = cooldown.clone();
+        let slot = slot.clone();
         let re_armed = re_armed.clone();
         Arc::new(move |d: Duration| {
             log.lock().unwrap().push(d);
@@ -181,11 +185,15 @@ fn cooldown_wait_loops_until_past_and_keeps_precision() {
             std::thread::sleep(d.min(Duration::from_millis(200)));
             // 首次冷却睡眠期间，"其他 worker"又撞了一次 429：冷却再布防到 +2s
             if !re_armed.swap(true, Ordering::SeqCst) {
-                *cooldown.lock().unwrap() = Instant::now() + Duration::from_secs(2);
+                slot.lock().unwrap().as_ref().unwrap().arm_cooldown(Duration::from_secs(2));
             }
         })
     };
-    let cfg = SchedulerConfig { jobs: 1, cooldown, fetch: Arc::new(|real: &dyn Fn() -> anyhow::Result<()>| real()), sleep, ..Default::default() };
+    let base = SchedulerConfig { jobs: 1, fetch: Arc::new(|real: &dyn Fn() -> anyhow::Result<()>| real()), sleep, ..Default::default() };
+    let throttle = Throttle::new(&base);
+    throttle.arm_cooldown(Duration::from_secs(60)); // 预布防：首片认领前必须消费
+    *slot.lock().unwrap() = Some(throttle.clone());
+    let cfg = SchedulerConfig { throttle: Some(throttle), ..base };
     let td = tempfile::tempdir().unwrap();
     let main = td.path().join("repo");
     run(&plan, &main, &cfg).unwrap();
