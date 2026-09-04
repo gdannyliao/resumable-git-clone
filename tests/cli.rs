@@ -153,7 +153,10 @@ fn instance_lock_rejects_second() {
     assert!(!plan_path(&dest).exists(), "lock must precede planning");
     assert!(!dest.join(".git").exists(), "lock must precede any git mutation");
 
-    drop(lock_file); // 释放 → 可重新取得（guard drop 语义）
+    // 显式 unlock（而非仅 drop 关 fd）：macOS close-flock 有毫秒级异步释放窗，
+    // CI 负载下紧随其后的重取可能撞窗 —— 产品路径正是因此做了显式 LOCK_UN。
+    lock_file.unlock().unwrap();
+    drop(lock_file);
     let _guard = acquire_instance_lock(&dest).unwrap();
 }
 

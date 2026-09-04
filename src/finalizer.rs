@@ -43,8 +43,12 @@ fn default_branch(plan: &Plan) -> String {
     }
 }
 
-/// refs 与服务端实时快照一致 + 全对象图连通
+/// refs 与服务端实时快照一致 + 全对象图连通 + 显式确认无浅边界（spec §3：
+/// 校验无 shallow 边界；A.6 完成门与 B1 搬运断言是间接保障，此处直接明示）
 pub fn verify(plan: &Plan, main: &Path) -> Result<()> {
+    if crate::gitio::is_shallow(main) {
+        bail!("main repo still has shallow boundaries — clone is incomplete, rerun to resume");
+    }
     let remote = crate::refs::ls_remote(&plan.url)?;
     let mut bad = Vec::new();
     for b in &remote.branches {

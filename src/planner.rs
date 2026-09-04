@@ -45,7 +45,8 @@ impl Piece {
     pub fn id(&self) -> String {
         match self {
             Piece::Chain { full_ref, .. } => format!("chain:{}", full_ref),
-            Piece::TagBatch { tags } => format!("tags:{}", tags[0].short_name),
+            // 空批按构造不会出现（build_plan 按非空分批）；防御手编 plan.json
+            Piece::TagBatch { tags } => format!("tags:{}", tags.first().map(|t| t.short_name.as_str()).unwrap_or("<empty>")),
         }
     }
     pub fn piece_dir_name(&self) -> String {
