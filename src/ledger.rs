@@ -11,8 +11,8 @@
 //! 只读路径（status 命令）不走本模块 —— A.8：status 严格只读，
 //! 用 `State::load` 直接读，绝不 reconcile。
 
-use crate::planner::Plan;
-use crate::state::{PieceState, PieceStatus, State};
+use crate::planner::{Piece, Plan};
+use crate::state::{ChainState, PieceState, PieceStatus, State};
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,16 @@ use std::sync::{Arc, Mutex};
 pub struct Ledger {
     dir: PathBuf,
     state: Arc<Mutex<State>>,
+}
+
+/// 认领结果：片的不可变身份（plan 侧）与可变进度（state 侧）的配对。
+/// 配对在认领瞬间完成 —— 调用方不再拿 idx 跨 plan/state 两个平行 Vec
+/// 手工对齐。链式片的 `ps.chain` 保证为 Some（认领时补全，不变式由
+/// 本 seam 保证而非执行侧兜底）。
+pub struct Claim {
+    pub idx: usize,
+    pub piece: Piece,
+    pub ps: PieceState,
 }
 
 impl Ledger {
@@ -52,8 +62,10 @@ impl Ledger {
     /// write-ahead 认领（A.15c）：状态变更 + 落盘在锁内完成 —— Running 先落盘
     /// 再执行。C2：认领时给耗尽预算的片重新计费（attempts 只约束单次 run 内的
     /// 重试，rerun 给每个片全新预算）；限流计数同哲学，认领时清零。
+    /// 配对：返回的 Claim 把 plan 侧身份与 state 侧进度配成一对（同一 idx，
+    /// 锁内完成）；链式片的链状态缺失时按 PieceState::new 同一出处补全。
     /// 返回 None = 已无 Pending 片。
-    pub fn claim(&self, max_attempts: u32) -> Result<Option<(usize, String)>> {
+    pub fn claim(&self, plan: &Plan, max_attempts: u32) -> Result<Option<Claim>> {
         let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(idx) = g.pieces.iter().position(|p| p.status == PieceStatus::Pending) else {
             return Ok(None);
@@ -62,14 +74,14 @@ impl Ledger {
             g.pieces[idx].attempts = 0;
         }
         g.pieces[idx].rate_limits = 0;
+        // 链片必须有链状态（缺失 = 异常现场：手编 state.json / 对账后的
+        // 人工干预）——按唯一出处补全，write-ahead 一同落盘
+        if matches!(plan.pieces[idx], Piece::Chain { .. }) && g.pieces[idx].chain.is_none() {
+            g.pieces[idx].chain = Some(ChainState::initial(plan.initial_step));
+        }
         g.pieces[idx].status = PieceStatus::Running;
         g.save(&self.dir)?;
-        Ok(Some((idx, g.pieces[idx].id.clone())))
-    }
-
-    /// 锁内克隆出片的私有副本：执行（可能数分钟）全程不持锁。
-    pub fn snapshot(&self, idx: usize) -> PieceState {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).pieces[idx].clone()
+        Ok(Some(Claim { idx, piece: plan.pieces[idx].clone(), ps: g.pieces[idx].clone() }))
     }
 
     /// 执行完成后整体回写 + 落盘（片认领后无人再动它的槽位，idx 稳定有效；
@@ -211,16 +223,52 @@ mod tests {
         st.pieces[0].rate_limits = 7;
         plant_state(&main, &st);
         let ledger = Ledger::open(&main, &plan).unwrap();
-        let (idx, id) = ledger.claim(5).unwrap().expect("one piece claimable");
-        assert_eq!(idx, 0);
-        assert_eq!(id, plan.pieces[0].id());
-        let ps = ledger.snapshot(idx);
-        assert_eq!(ps.status, PieceStatus::Running);
-        assert_eq!(ps.attempts, 0, "exhausted budget must be rebilled at claim (C2)");
-        assert_eq!(ps.rate_limits, 0, "consecutive rate-limit count resets at claim");
+        let claim = ledger.claim(&plan, 5).unwrap().expect("one piece claimable");
+        assert_eq!(claim.idx, 0);
+        assert_eq!(claim.piece.id(), plan.pieces[0].id());
+        assert_eq!(claim.ps.status, PieceStatus::Running);
+        assert_eq!(claim.ps.attempts, 0, "exhausted budget must be rebilled at claim (C2)");
+        assert_eq!(claim.ps.rate_limits, 0, "consecutive rate-limit count resets at claim");
         // write-ahead：磁盘上必须先见 Running（绕过 State::load 的折返，直读原文）
         let raw: State = load_json(&main.join(".rgc/state.json")).unwrap().unwrap();
         assert_eq!(raw.pieces[0].status, PieceStatus::Running, "Running must hit disk before execution");
+    }
+
+    /// 配对不变式：claim 返回的 (piece, ps) 来自同一槽位 —— 身份与进度一致，
+    /// 调用方不再拿 idx 跨 plan/state 两个 Vec 手工对齐。
+    #[test]
+    fn claim_pairs_piece_identity_with_state() {
+        let td = tempfile::tempdir().unwrap();
+        let main = td.path().join("repo");
+        init_main(&main);
+        let plan = sample_plan();
+        let ledger = Ledger::open(&main, &plan).unwrap();
+        let claim = ledger.claim(&plan, 5).unwrap().unwrap();
+        assert_eq!(claim.piece.id(), claim.ps.id, "paired entry: identity and progress must agree");
+        assert_eq!(claim.piece.id(), plan.pieces[claim.idx].id());
+    }
+
+    /// 链式片的链状态由认领保证：state 里 chain 缺失（如对账重建的 Done 片被
+    /// 人工改回 Pending，或手编 state.json）时，claim 必须补上初始链状态 ——
+    /// run_piece 不再有防御性兜底。
+    #[test]
+    fn claim_initializes_missing_chain_state() {
+        let td = tempfile::tempdir().unwrap();
+        let main = td.path().join("repo");
+        init_main(&main);
+        let plan = sample_plan();
+        let mut st = State::new(&plan);
+        st.pieces[0].chain = None; // 链片缺链状态的异常现场
+        plant_state(&main, &st);
+        let ledger = Ledger::open(&main, &plan).unwrap();
+        let claim = ledger.claim(&plan, 5).unwrap().unwrap();
+        let chain = claim.ps.chain.expect("chain piece must carry chain state after claim");
+        assert_eq!(chain.depth_done, 0);
+        assert_eq!(chain.step, plan.initial_step);
+        assert!(!chain.no_shallow);
+        // 补上的初始状态随 write-ahead 落盘
+        let raw: State = load_json(&main.join(".rgc/state.json")).unwrap().unwrap();
+        assert!(raw.pieces[claim.idx].chain.is_some());
     }
 
     #[test]
@@ -230,9 +278,9 @@ mod tests {
         init_main(&main);
         let plan = sample_plan();
         let ledger = Ledger::open(&main, &plan).unwrap();
-        assert!(ledger.claim(5).unwrap().is_some());
-        assert!(ledger.claim(5).unwrap().is_some());
-        assert!(ledger.claim(5).unwrap().is_none(), "no Pending left");
+        assert!(ledger.claim(&plan, 5).unwrap().is_some());
+        assert!(ledger.claim(&plan, 5).unwrap().is_some());
+        assert!(ledger.claim(&plan, 5).unwrap().is_none(), "no Pending left");
         assert!(!ledger.has_pending());
     }
 
@@ -243,14 +291,14 @@ mod tests {
         init_main(&main);
         let plan = sample_plan();
         let ledger = Ledger::open(&main, &plan).unwrap();
-        let (idx, _) = ledger.claim(5).unwrap().unwrap();
-        let mut ps = ledger.snapshot(idx);
+        let claim = ledger.claim(&plan, 5).unwrap().unwrap();
+        let mut ps = claim.ps;
         ps.status = PieceStatus::Done;
         ps.bytes = 4096;
-        ledger.complete(idx, ps).unwrap();
+        ledger.complete(claim.idx, ps).unwrap();
         let on_disk = State::load(&main).unwrap().unwrap();
-        assert_eq!(on_disk.pieces[idx].status, PieceStatus::Done);
-        assert_eq!(on_disk.pieces[idx].bytes, 4096);
+        assert_eq!(on_disk.pieces[claim.idx].status, PieceStatus::Done);
+        assert_eq!(on_disk.pieces[claim.idx].bytes, 4096);
         assert_eq!(ledger.max_piece_bytes(), 4096);
         assert_eq!(ledger.unfinished_ids(), vec![plan.pieces[1].id()]);
     }

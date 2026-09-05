@@ -20,6 +20,13 @@ pub struct ChainState {
     pub no_shallow: bool,
 }
 
+impl ChainState {
+    /// 初始链状态的唯一出处（depth 0 / plan 初始步长 / shallow 可用）。
+    pub fn initial(step: u32) -> ChainState {
+        ChainState { depth_done: 0, step, no_shallow: false }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PieceState {
     pub id: String,
@@ -34,6 +41,25 @@ pub struct PieceState {
     pub rate_limits: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<ChainState>,
+}
+
+impl PieceState {
+    /// 新片状态的唯一出处：链式片带初始链状态（初始步长来自 plan），
+    /// 标签批片无链状态。State::new / recovery::reconcile / Ledger::claim
+    /// 的链状态补全都经此构造，不再各处手写字面量。
+    pub fn new(piece: &Piece, initial_step: u32) -> PieceState {
+        PieceState {
+            id: piece.id(),
+            status: PieceStatus::Pending,
+            attempts: 0,
+            bytes: 0,
+            rate_limits: 0,
+            chain: match piece {
+                Piece::Chain { .. } => Some(ChainState::initial(initial_step)),
+                Piece::TagBatch { .. } => None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,21 +79,7 @@ fn state_path(dir: &Path) -> PathBuf {
 
 impl State {
     pub fn new(plan: &Plan) -> State {
-        let pieces = plan
-            .pieces
-            .iter()
-            .map(|p| PieceState {
-                id: p.id(),
-                status: PieceStatus::Pending,
-                attempts: 0,
-                bytes: 0,
-                rate_limits: 0,
-                chain: match p {
-                    Piece::Chain { .. } => Some(ChainState { depth_done: 0, step: plan.initial_step, no_shallow: false }),
-                    Piece::TagBatch { .. } => None,
-                },
-            })
-            .collect();
+        let pieces = plan.pieces.iter().map(|p| PieceState::new(p, plan.initial_step)).collect();
         State { fingerprint: plan.fingerprint(), pieces }
     }
 
@@ -110,6 +122,19 @@ mod tests {
             tags: vec![],
         };
         build_plan("https://x/y.git", &refs, &PlannerConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn fresh_piece_state_knows_piece_kind() {
+        let plan = sample_plan();
+        // 链式片：带初始链状态（初始步长来自 plan）；初始构造的唯一出处
+        let ps = PieceState::new(&plan.pieces[0], plan.initial_step);
+        let c = ps.chain.expect("chain piece must carry initial chain state");
+        assert_eq!(c.depth_done, 0);
+        assert_eq!(c.step, plan.initial_step);
+        assert!(!c.no_shallow);
+        assert_eq!(ps.status, PieceStatus::Pending);
+        assert_eq!(ps.id, plan.pieces[0].id());
     }
 
     #[test]

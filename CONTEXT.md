@@ -32,7 +32,7 @@ _Avoid_: 临时仓库、缓存仓库
 _Avoid_: 进度文件、检查点
 
 **认领（Claim）**:
-worker 在台账锁内把 Pending 片置 Running 并落盘；认领时对耗尽预算 rebill（attempts/rate_limits 清零）。
+worker 在台账锁内把 Pending 片置 Running 并落盘；认领时对耗尽预算 rebill（attempts/rate_limits 清零）。认领结果 Claim 是配对 entry——片的不可变身份（plan 侧 Piece）与可变进度（state 侧 PieceState）在认领瞬间配成一对，调用方不再跨两个平行 Vec 对齐；链式片的链状态由认领保证。
 
 **对账（Reconcile）**:
 台账缺失/损坏时，fsck 验证主仓库完整性后按已存在 refs 重建台账；不健康则擦除 remote 侧引用与片仓库再验证，仍失败即放弃。破坏性 git 手术集中在 recovery.rs——台账 module（state.rs / ledger.rs）不含手术知识。

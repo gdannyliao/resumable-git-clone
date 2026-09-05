@@ -8,7 +8,7 @@
 
 use crate::gitio;
 use crate::planner::{Piece, Plan};
-use crate::state::{pieces_dir, ChainState, PieceState, PieceStatus, State};
+use crate::state::{pieces_dir, PieceState, PieceStatus, State};
 
 /// state.json 缺失/损坏时的对账重建：
 /// 先 fsck 验证主仓库完整性；不健康 → 清掉 remote 侧全部引用（origin/tags/rgc）与片仓库
@@ -42,20 +42,18 @@ pub fn reconcile(plan: &Plan, main: &std::path::Path) -> State {
                     Piece::Chain { short_name, .. } => gitio::run_git(&["rev-parse", "--verify", &format!("refs/remotes/origin/{}", short_name)], Some(main)).is_ok(),
                     Piece::TagBatch { tags } => tags.iter().all(|t| gitio::run_git(&["rev-parse", "--verify", &t.full_name], Some(main)).is_ok()),
                 };
-            PieceState {
-                id: p.id(),
-                status: if done { PieceStatus::Done } else { PieceStatus::Pending },
-                attempts: 0,
-                bytes: 0,
-                rate_limits: 0,
-                chain: if done {
-                    None
-                } else {
-                    match p {
-                        Piece::Chain { .. } => Some(ChainState { depth_done: 0, step: plan.initial_step, no_shallow: false }),
-                        Piece::TagBatch { .. } => None,
-                    }
-                },
+            if done {
+                PieceState {
+                    id: p.id(),
+                    status: PieceStatus::Done,
+                    attempts: 0,
+                    bytes: 0,
+                    rate_limits: 0,
+                    chain: None, // 已完成片无需链状态
+                }
+            } else {
+                // 未完成片：与 State::new 同一出处（链片带初始链状态）
+                PieceState::new(p, plan.initial_step)
             }
         })
         .collect();

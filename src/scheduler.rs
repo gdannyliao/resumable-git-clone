@@ -203,7 +203,7 @@ fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, thro
         if throttle.tripped() {
             break;
         }
-        let claimed = match ledger.claim(cfg.max_attempts) {
+        let claimed = match ledger.claim(plan, cfg.max_attempts) {
             Ok(claimed) => claimed,
             Err(e) => {
                 // 保存失败绝不带伤执行：本 worker 就此收工，run 统一报告
@@ -212,10 +212,11 @@ fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, thro
                 break;
             }
         };
-        let Some((idx, id)) = claimed else {
+        let Some(claim) = claimed else {
             break;
         };
-        if let Err(e) = execute_piece(plan, main, ledger, idx, cfg, throttle) {
+        let id = claim.ps.id.clone();
+        if let Err(e) = execute_piece(plan, main, ledger, claim, cfg, throttle) {
             // A.15a：全局放弃优先于逐片失败报告
             if throttle.tripped() {
                 break;
@@ -227,11 +228,11 @@ fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, thro
     failures
 }
 
-/// 片执行（A.15c）：预检与结果回写经 Ledger 在状态锁内进行；片执行本身
-/// （可能数分钟）完全不持锁 —— 其他 worker 的认领/落盘不受阻塞。ps 是
-/// Ledger 克隆出的私有副本，完成时整体回写（见 Ledger::snapshot/complete）。
-fn execute_piece(plan: &Plan, main: &Path, ledger: &Ledger, idx: usize, cfg: &SchedulerConfig, throttle: &Throttle) -> Result<()> {
-    let piece = plan.pieces[idx].clone();
+/// 片执行（A.15c）：磁盘预检后执行认领来的配对 entry（身份 + 进度），
+/// 完成时整体回写落盘；片执行本身（可能数分钟）完全不持锁 —— 其他
+/// worker 的认领/落盘不受阻塞。
+fn execute_piece(plan: &Plan, main: &Path, ledger: &Ledger, claim: crate::ledger::Claim, cfg: &SchedulerConfig, throttle: &Throttle) -> Result<()> {
+    let crate::ledger::Claim { idx, piece, mut ps } = claim;
     // 磁盘预检：按历史最大片字节 × 1.5 估算
     let max_seen = ledger.max_piece_bytes();
     let estimate = (max_seen as f64 * 1.5) as u64;
@@ -242,7 +243,6 @@ fn execute_piece(plan: &Plan, main: &Path, ledger: &Ledger, idx: usize, cfg: &Sc
             }
         }
     }
-    let mut ps = ledger.snapshot(idx);
     let piece_path: PathBuf = pieces_dir(main).join(piece.piece_dir_name());
     let res = run_piece(&piece, plan, main, &piece_path, &mut ps, cfg, throttle);
     ledger.complete(idx, ps)?;
@@ -265,10 +265,8 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
         }
         let res = match piece {
             Piece::Chain { .. } => {
-                let chain = ps
-                    .chain
-                    .clone()
-                    .unwrap_or(ChainState { depth_done: 0, step: plan.initial_step, no_shallow: false });
+                // 链状态由 Ledger::claim 保证（认领时补全），此处不再防御性兜底
+                let chain = ps.chain.clone().expect("Ledger::claim guarantees chain state for chain pieces");
                 run_chain(piece, plan, main, ps, chain, cfg, throttle)
             }
             Piece::TagBatch { tags } => run_tags(plan, main, piece_path, tags, ps, cfg),
