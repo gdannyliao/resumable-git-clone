@@ -9,51 +9,31 @@ pub enum FailureKind {
     Fatal,
 }
 
+/// 分类错误：类别 + 消息。（原为与 FailureKind 1:1 平行的五变体枚举，
+/// 折叠为单结构体 —— 三个互译 match 随之消失，deletion test 通过。）
 #[derive(Debug)]
-pub enum RgcError {
-    RateLimited(String),
-    Congestion(String),
-    Network(String),
-    ShallowUnsupported(String),
-    Fatal(String),
+pub struct RgcError {
+    kind: FailureKind,
+    message: String,
 }
 
 impl RgcError {
+    pub fn new(kind: FailureKind, message: String) -> Self {
+        Self { kind, message }
+    }
+
     pub fn kind(&self) -> FailureKind {
-        match self {
-            RgcError::RateLimited(_) => FailureKind::RateLimited,
-            RgcError::Congestion(_) => FailureKind::Congestion,
-            RgcError::Network(_) => FailureKind::Network,
-            RgcError::ShallowUnsupported(_) => FailureKind::ShallowUnsupported,
-            RgcError::Fatal(_) => FailureKind::Fatal,
-        }
+        self.kind
     }
 
     pub fn message(&self) -> &str {
-        match self {
-            RgcError::RateLimited(m)
-            | RgcError::Congestion(m)
-            | RgcError::Network(m)
-            | RgcError::ShallowUnsupported(m)
-            | RgcError::Fatal(m) => m,
-        }
-    }
-
-    /// Task 4 的 run_git 用这个构造，避免 match 重复
-    pub fn from_kind(kind: FailureKind, msg: String) -> Self {
-        match kind {
-            FailureKind::RateLimited => RgcError::RateLimited(msg),
-            FailureKind::Congestion => RgcError::Congestion(msg),
-            FailureKind::Network => RgcError::Network(msg),
-            FailureKind::ShallowUnsupported => RgcError::ShallowUnsupported(msg),
-            FailureKind::Fatal => RgcError::Fatal(msg),
-        }
+        &self.message
     }
 }
 
 impl fmt::Display for RgcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{:?}] {}", self.kind(), self.message())
+        write!(f, "[{:?}] {}", self.kind, self.message)
     }
 }
 
@@ -61,7 +41,7 @@ impl std::error::Error for RgcError {}
 
 /// 从 anyhow::Error 提取失败类别（无法识别 → Fatal）
 pub fn kind_of(err: &anyhow::Error) -> FailureKind {
-    err.downcast_ref::<RgcError>().map(|e| e.kind()).unwrap_or(FailureKind::Fatal)
+    err.downcast_ref::<RgcError>().map(|e| e.kind).unwrap_or(FailureKind::Fatal)
 }
 
 /// 按 git stderr 关键词分类。
@@ -152,7 +132,7 @@ mod tests {
 
     #[test]
     fn kind_of_wraps_through_anyhow() {
-        let e: anyhow::Error = RgcError::Network("boom".into()).into();
+        let e: anyhow::Error = RgcError::new(FailureKind::Network, "boom".into()).into();
         assert_eq!(kind_of(&e), FailureKind::Network);
     }
 
@@ -163,15 +143,8 @@ mod tests {
     }
 
     #[test]
-    fn from_kind_roundtrips() {
-        for (k, msg) in [
-            (FailureKind::RateLimited, "a"),
-            (FailureKind::Congestion, "b"),
-            (FailureKind::Network, "c"),
-            (FailureKind::ShallowUnsupported, "d"),
-            (FailureKind::Fatal, "e"),
-        ] {
-            assert_eq!(RgcError::from_kind(k, msg.into()).kind(), k);
-        }
+    fn display_shows_kind_and_message() {
+        let e = RgcError::new(FailureKind::Congestion, "reset".into());
+        assert_eq!(e.to_string(), "[Congestion] reset");
     }
 }

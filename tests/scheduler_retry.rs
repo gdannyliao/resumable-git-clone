@@ -8,7 +8,7 @@
 
 mod common;
 use common::*;
-use rgc::errors::RgcError;
+use rgc::errors::{FailureKind, RgcError};
 use rgc::planner::{build_plan, PlannerConfig};
 use rgc::refs::ls_remote;
 use rgc::scheduler::{run, FetchHook, SchedulerConfig, SleepHook};
@@ -32,8 +32,8 @@ fn fail_first_then_real(err: RgcError, fail_times: usize) -> (FetchHook, Calls) 
             let mut n = calls.lock().unwrap();
             *n += 1;
             if *n <= fail_times {
-                // RgcError 无 Clone：经公开访问ors 按类别+消息重建一份注入错误
-                let e = RgcError::from_kind(err.kind(), err.message().to_owned());
+                // RgcError 无 Clone：按类别+消息重建一份注入错误
+                let e = RgcError::new(err.kind(), err.message().to_owned());
                 return Err(e.into());
             }
             drop(n);
@@ -80,7 +80,7 @@ fn exhaustion_terminates_cleanly() {
     let origin = build_origin(10, &[], &[]);
     let url = origin.to_str().unwrap();
     let plan = plan_for(url, 20);
-    let (fetch, calls) = fail_first_then_real(RgcError::Network("injected network failure".into()), usize::MAX);
+    let (fetch, calls) = fail_first_then_real(RgcError::new(FailureKind::Network, "injected network failure".into()), usize::MAX);
     let cfg = cfg_with(fetch);
     let td = tempfile::tempdir().unwrap();
     let main = td.path().join("repo");
@@ -100,7 +100,7 @@ fn retry_then_success() {
     let origin = build_origin(8, &[], &[]);
     let url = origin.to_str().unwrap();
     let plan = plan_for(url, 20);
-    let (fetch, calls) = fail_first_then_real(RgcError::Network("injected flake".into()), 2);
+    let (fetch, calls) = fail_first_then_real(RgcError::new(FailureKind::Network, "injected flake".into()), 2);
     let cfg = cfg_with(fetch);
     let td = tempfile::tempdir().unwrap();
     let main = td.path().join("repo");
@@ -119,7 +119,7 @@ fn rate_limited_does_not_burn_budget() {
     let origin = build_origin(8, &[], &[]);
     let url = origin.to_str().unwrap();
     let plan = plan_for(url, 20);
-    let (fetch, calls) = fail_first_then_real(RgcError::RateLimited("HTTP 429".into()), 3);
+    let (fetch, calls) = fail_first_then_real(RgcError::new(FailureKind::RateLimited, "HTTP 429".into()), 3);
     // 注入预构造的 Throttle：run() 用它而非自造，事后经探针断言冷却确曾布防
     let throttle = Throttle::new(&cfg_with(fetch.clone()));
     let cfg = SchedulerConfig { throttle: Some(throttle.clone()), ..cfg_with(fetch) };
@@ -143,7 +143,7 @@ fn rate_limit_storm_gives_up() {
     let origin = build_origin(10, &[], &[]);
     let url = origin.to_str().unwrap();
     let plan = plan_for(url, 20);
-    let (fetch, calls) = fail_first_then_real(RgcError::RateLimited("HTTP 429".into()), usize::MAX);
+    let (fetch, calls) = fail_first_then_real(RgcError::new(FailureKind::RateLimited, "HTTP 429".into()), usize::MAX);
     let mut cfg = cfg_with(fetch);
     cfg.max_rate_limits = 3;
     let td = tempfile::tempdir().unwrap();
@@ -169,11 +169,11 @@ fn rate_limit_budget_is_rebilled_on_rerun() {
     let td = tempfile::tempdir().unwrap();
     let main = td.path().join("repo");
     // 第一轮：429 风暴（上限 3）→ Failed，rate_limits 已到顶
-    let (storm, _) = fail_first_then_real(RgcError::RateLimited("HTTP 429".into()), usize::MAX);
+    let (storm, _) = fail_first_then_real(RgcError::new(FailureKind::RateLimited, "HTTP 429".into()), usize::MAX);
     let cfg = SchedulerConfig { max_rate_limits: 3, fetch: storm, sleep: no_sleep(), ..Default::default() };
     assert!(run(&plan, &main, &cfg).is_err());
     // rerun：仅 1 次限流后放行 → 必须以全新限流配额出发并跑完
-    let (one_flake, calls) = fail_first_then_real(RgcError::RateLimited("HTTP 429".into()), 1);
+    let (one_flake, calls) = fail_first_then_real(RgcError::new(FailureKind::RateLimited, "HTTP 429".into()), 1);
     let cfg2 = SchedulerConfig { max_rate_limits: 3, fetch: one_flake, sleep: no_sleep(), ..Default::default() };
     run(&plan, &main, &cfg2).unwrap();
     let st = State::load(&main).unwrap().unwrap();

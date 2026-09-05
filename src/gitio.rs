@@ -43,7 +43,7 @@ pub fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<GitOutput> {
     if !out.status.success() {
         let shown: Vec<String> = args.iter().map(|a| redact(a)).collect();
         let msg = format!("git {:?} failed (exit {:?}): {}", shown, out.status.code(), res.stderr.trim_end());
-        return Err(RgcError::from_kind(classify(&res.stderr), msg).into());
+        return Err(RgcError::new(classify(&res.stderr), msg).into());
     }
     Ok(res)
 }

@@ -98,7 +98,7 @@ fn rate_limit_storm_bails_run() {
         let calls = calls.clone();
         Arc::new(move |_real: &dyn Fn() -> anyhow::Result<()>| {
             calls.fetch_add(1, Ordering::Relaxed);
-            Err(rgc::errors::RgcError::RateLimited("HTTP 429".into()).into())
+            Err(rgc::errors::RgcError::new(rgc::errors::FailureKind::RateLimited, "HTTP 429".into()).into())
         })
     };
     let sleep_log: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -231,7 +231,7 @@ fn gate_parked_worker_exits_when_work_drains() {
                 }
             };
             if n {
-                Err(rgc::errors::RgcError::RateLimited("HTTP 429".into()).into())
+                Err(rgc::errors::RgcError::new(rgc::errors::FailureKind::RateLimited, "HTTP 429".into()).into())
             } else {
                 real()
             }

@@ -360,7 +360,7 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
     loop {
         iterations += 1;
         if iterations > MAX_CHAIN_ITERATIONS {
-            return Err(RgcError::Network(format!(
+            return Err(RgcError::new(FailureKind::Network, format!(
                 "chain piece {} exceeded {MAX_CHAIN_ITERATIONS} fetch iterations without completing — aborting this run (retryable)",
                 ps.id
             ))
@@ -392,7 +392,7 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
         // → 可重试错误（计入 attempts 预算），防止空 pack 死循环。dir_size 粒度
         // 可能掩盖真实推进（同字节数的引用更新），故提交计数不变才是必要条件。
         if added_bytes == 0 && c1 == c0 && !complete {
-            return Err(RgcError::Network(format!(
+            return Err(RgcError::new(FailureKind::Network, format!(
                 "zero-progress fetch on {} (depth_done={depth_done}, step={step}, +0 bytes, +0 commits) — empty pack, shallow boundary persists",
                 ps.id
             ))
