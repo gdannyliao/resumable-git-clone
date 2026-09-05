@@ -1,8 +1,9 @@
 mod common;
 use common::*;
 use rgc::planner::{build_plan, PlannerConfig};
+use rgc::recovery::reconcile;
 use rgc::refs::ls_remote;
-use rgc::state::{reconcile, PieceStatus};
+use rgc::state::PieceStatus;
 
 #[test]
 fn reconcile_marks_completed_refs_done() {

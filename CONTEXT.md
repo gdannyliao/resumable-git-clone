@@ -28,14 +28,14 @@ _Avoid_: 临时仓库、缓存仓库
 `plan.json` 记录片集合；指纹是 url + 有序片 id 的 FNV-1a 哈希，state.json 携带之，不匹配 = 大声报错，绝不静默重规划。
 
 **台账（State / Ledger）**:
-`state.json`，断点唯一真相源；write-ahead——先落盘 Running 再执行。任何故障的恢复路径都收敛到"重读台账、继续调度"。代码上分为 state.rs（数据 + 序列化 + 崩溃折返 + 对账）与 ledger.rs（Ledger module：write-ahead 协议的 mutating interface——open / claim / snapshot / complete）。只读路径（status）走 State::load，不走 Ledger。
+`state.json`，断点唯一真相源；write-ahead——先落盘 Running 再执行。任何故障的恢复路径都收敛到"重读台账、继续调度"。代码上分为 state.rs（数据 + 序列化 + 崩溃折返）与 ledger.rs（Ledger module：write-ahead 协议的 mutating interface——open / claim / snapshot / complete）。只读路径（status）走 State::load，不走 Ledger。
 _Avoid_: 进度文件、检查点
 
 **认领（Claim）**:
 worker 在台账锁内把 Pending 片置 Running 并落盘；认领时对耗尽预算 rebill（attempts/rate_limits 清零）。
 
 **对账（Reconcile）**:
-台账缺失/损坏时，fsck 验证主仓库完整性后按已存在 refs 重建台账；不健康则擦除 remote 侧引用与片仓库再验证，仍失败即放弃。
+台账缺失/损坏时，fsck 验证主仓库完整性后按已存在 refs 重建台账；不健康则擦除 remote 侧引用与片仓库再验证，仍失败即放弃。破坏性 git 手术集中在 recovery.rs——台账 module（state.rs / ledger.rs）不含手术知识。
 
 **Throttle（降速器）**:
 run 级降速 module，独占全部 run 级限流信号：冷却、断路器、并发减半闸门、风暴退避升级。interface：`on_failure(kind)` / `tripped()` / `storm_backoff(n)` / `wait_turn(worker, has_pending)`。片级连续限流计数不在其中——那是台账状态。

@@ -36,7 +36,8 @@ impl Ledger {
             Some(s) if s.fingerprint == plan.fingerprint() => s,
             Some(_) => bail!("plan/state mismatch — delete .rgc/ or restore plan.json"),
             // state 缺失/损坏（load_json 把损坏视同缺失）→ 对账重建
-            None => crate::state::reconcile(plan, dir),
+            //（破坏性 git 手术集中在 recovery module）
+            None => crate::recovery::reconcile(plan, dir),
         };
         // C1：Failed 是上一轮的终态 —— rerun 折返 Pending 重新出发
         for p in &mut st.pieces {

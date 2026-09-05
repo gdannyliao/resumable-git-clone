@@ -9,6 +9,7 @@ pub mod gitio;
 pub mod jsonio;
 pub mod ledger;
 pub mod planner;
+pub mod recovery;
 pub mod refs;
 pub mod scheduler;
 pub mod state;
