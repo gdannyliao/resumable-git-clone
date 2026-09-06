@@ -19,12 +19,12 @@ piece, not the whole repository.
 ## Requirements
 
 - git ≥ 2.26 (the test suite needs ≥ 2.28)
-- macOS / Linux (Windows is unsupported: path and file-locking behavior unverified)
+- macOS / Linux / Windows (CI-verified on all three, including the kill-resilience acceptance test)
 - This tool does not touch proxies/mirrors; it talks to the remote directly
 
 ## Install
 
-Prebuilt binaries (Linux x86_64 / macOS arm64 / macOS x86_64) are on
+Prebuilt binaries (Linux x86_64 / macOS arm64 / macOS x86_64 / Windows x86_64) are on
 [GitHub Releases](https://github.com/gdannyliao/resumable-git-clone/releases); or install from source:
 
 ```sh

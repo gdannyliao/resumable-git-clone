@@ -15,12 +15,12 @@ git smart protocol 无法字节级续传：一次 `git clone` 中断后只能从
 ## Requirements
 
 - git ≥ 2.26（测试套件需要 ≥ 2.28）
-- macOS / Linux（Windows 未支持：路径与文件锁行为未验证）
+- macOS / Linux / Windows（CI 三平台验收，含 kill 强杀续传测试）
 - 本工具不碰代理/镜像，直连远端
 
 ## Install
 
-预编译二进制（Linux x86_64 / macOS arm64 / macOS x86_64）见
+预编译二进制（Linux x86_64 / macOS arm64 / macOS x86_64 / Windows x86_64）见
 [GitHub Releases](https://github.com/gdannyliao/resumable-git-clone/releases)；或从源码安装：
 
 ```sh

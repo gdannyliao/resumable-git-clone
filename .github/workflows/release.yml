@@ -19,6 +19,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -28,14 +30,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p dist
           tar -czf "dist/rgc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" rgc
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/rgc.exe" `
+            -DestinationPath "dist/rgc-${{ github.ref_name }}-${{ matrix.target }}.zip"
       - name: Attach binaries to release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: dist/*
           generate_release_notes: true
