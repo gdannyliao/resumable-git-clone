@@ -1,5 +1,7 @@
 # rgc — resumable git clone
 
+[English README](README.en.md)
+
 `rgc`（"resumable git clone"）面向**超大仓库**（chromium / monorepo 级）的断点续传克隆工具：
 把一次 `git clone` 拆成大量独立、幂等的小任务（每分支一条 `--depth/--deepen` 链 + 标签批片），
 write-ahead 状态机记账，**任意时刻杀掉进程（kill -9）、断网、429 限流，重跑即续传**，
