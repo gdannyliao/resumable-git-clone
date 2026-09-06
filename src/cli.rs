@@ -219,8 +219,9 @@ pub fn status(dir: &Path) -> Result<()> {
 }
 
 /// `rgc clone <url>` 缺省 dest：URL 末段去 .git。
+/// 分隔符同时认 `/` 与 `\`：Windows 本地路径（C:\...\repo.git）按反斜杠分段。
 pub fn default_dir(url: &str) -> PathBuf {
-    let base = url.trim_end_matches('/').rsplit('/').next().unwrap_or("repo");
+    let base = url.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("repo");
     PathBuf::from(base.trim_end_matches(".git"))
 }
 
@@ -234,6 +235,14 @@ mod tests {
         assert_eq!(default_dir("https://example.com/foo/bar"), PathBuf::from("bar"));
         assert_eq!(default_dir("https://example.com/foo/bar/"), PathBuf::from("bar"));
         assert_eq!(default_dir("/tmp/x.git"), PathBuf::from("x"));
+    }
+
+    /// Windows 本地路径用反斜杠分隔：default_dir 必须同样取末段
+    /// （CI 实证：`rgc clone C:\t\origin.git` 曾把整串路径当目录名）
+    #[test]
+    fn default_dir_windows_style_path() {
+        assert_eq!(default_dir("C:\\temp\\x\\origin.git"), PathBuf::from("origin"));
+        assert_eq!(default_dir("D:\\a\\repo\\"), PathBuf::from("repo"));
     }
 
     #[test]
