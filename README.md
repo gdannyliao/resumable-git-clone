@@ -20,8 +20,11 @@ git smart protocol 无法字节级续传：一次 `git clone` 中断后只能从
 
 ## Install
 
+预编译二进制（Linux x86_64 / macOS arm64 / macOS x86_64）见
+[GitHub Releases](https://github.com/gdannyliao/resumable-git-clone/releases)；或从源码安装：
+
 ```sh
-cargo install --path .   # 开发安装；暂无发布渠道
+cargo install --path .   # 开发安装；发布渠道为 tag 触发的 CI Release
 ```
 
 ## Usage

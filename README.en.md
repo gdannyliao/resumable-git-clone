@@ -24,8 +24,11 @@ piece, not the whole repository.
 
 ## Install
 
+Prebuilt binaries (Linux x86_64 / macOS arm64 / macOS x86_64) are on
+[GitHub Releases](https://github.com/gdannyliao/resumable-git-clone/releases); or install from source:
+
 ```sh
-cargo install --path .   # development install; no release channel yet
+cargo install --path .   # development install; releases are cut by tag-triggered CI
 ```
 
 ## Usage
