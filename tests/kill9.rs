@@ -79,17 +79,25 @@ fn kill_and_resume_equals_git_clone() {
         .spawn()
         .unwrap();
     wait_for_partial_progress(&state_file, Duration::from_secs(10));
-    child.kill().expect("SIGKILL failed");
+    child.kill().expect("SIGKILL/TerminateProcess failed");
     let status = child.wait().unwrap();
     assert!(
         !status.success(),
         "clone exited successfully before the kill landed — fixture/args no longer guarantee a mid-flight kill"
     );
+    // kill 送达断言分平台：Unix 必须见 SIGKILL；Windows 无信号，
+    // Child::kill = TerminateProcess(handle, 1) → 退出码 1。
     #[cfg(unix)]
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&status),
         Some(9),
         "expected SIGKILL delivery, got {status:?}"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected TerminateProcess exit code 1, got {status:?}"
     );
 
     // —— 被杀现场的断言：state 永不撕裂（原子写），Done 记账在案 ——
