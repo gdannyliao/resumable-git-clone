@@ -77,12 +77,13 @@ pub fn acquire_instance_lock(dir: &Path) -> Result<InstanceLock> {
         .open(&path)
         .with_context(|| format!("cannot open lock file {}", path.display()))?;
     if let Err(e) = file.try_lock_exclusive() {
-        match e.kind() {
-            std::io::ErrorKind::WouldBlock => {
-                bail!("another rgc instance is running on this destination (lock: {})", path.display())
-            }
-            _ => return Err(e).with_context(|| format!("cannot lock {}", path.display())),
+        // Windows 的 LockFileEx 冲突报 ERROR_LOCK_VIOLATION (os error 33)，
+        // Rust 不映射为 WouldBlock（CI 实证）；Unix 的 EWOULDBLOCK 走 kind()。
+        let contended = e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33);
+        if contended {
+            bail!("another rgc instance is running on this destination (lock: {})", path.display())
         }
+        return Err(e).with_context(|| format!("cannot lock {}", path.display()));
     }
     Ok(InstanceLock { _file: file })
 }
