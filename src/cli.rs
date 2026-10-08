@@ -11,8 +11,9 @@
 //!
 //! 与计划正文的偏差：正文 clone_existing 自行 load/reconcile，现 API（A.16c）由
 //! `scheduler::run` 内部持有 `Arc<Mutex<State>>` 完成 load/指纹守卫/reconcile，
-//! 流程层只调 run()；正文的 indicatif 监视线程因此无法窥视状态，进度以调度器
-//! 既有的 eprintln 呈现（派发说明允许"keep it simple"）。
+//! 流程层只调 run()；运行期进度/速度由调度器内的监视线程呈现
+//! （台账快照 + 在途字节，见 [`crate::progress`]），重跑恢复点由
+//! `print_resume_hint` 只读 state 报告。
 
 use crate::finalizer;
 use crate::planner::{build_plan, load_plan, plan_path, save_plan, PlannerConfig, Plan, INITIAL_STEP};
@@ -117,6 +118,7 @@ pub fn clone_flow(url: &str, dest: &Path, opts: &CloneOptions) -> Result<()> {
                 );
             }
             eprintln!("rgc: found existing plan — resuming {}", dest.display());
+            print_resume_hint(dest, &plan);
             run_and_finalize(&plan, dest, opts)
         }
         None => {
@@ -132,8 +134,12 @@ pub fn clone_flow(url: &str, dest: &Path, opts: &CloneOptions) -> Result<()> {
             }
             eprintln!("rgc: planning {} → {}", url, dest.display());
             ensure_dest_vacant_for_fresh(dest)?;
+            // ls_remote 是规划阶段唯一的网络操作，且可能因网络卡顿长时间无返回 ——
+            // 前后各一行提示，让"卡在 planning 后无输出"可直接定位到网络层
+            eprintln!("rgc: querying remote refs…");
             let remote = ls_remote(url)?;
             let plan = build_plan(url, &remote, &PlannerConfig { initial_step: opts.initial_step, ..Default::default() })?;
+            eprintln!("{}", crate::progress::remote_summary(&remote, plan.pieces.len()));
             save_plan(dest, &plan)?;
             State::new(&plan).save(dest)?;
             run_and_finalize(&plan, dest, opts)
@@ -172,7 +178,24 @@ pub fn resume_flow(dest: &Path, opts: &CloneOptions) -> Result<()> {
     let _lock = acquire_instance_lock(dest)?;
     let plan = load_plan(dest)?.ok_or_else(|| anyhow!("no .rgc/plan.json in {} — nothing to resume", dest.display()))?;
     eprintln!("rgc: resuming {}", dest.display());
+    print_resume_hint(dest, &plan);
     run_and_finalize(&plan, dest, opts)
+}
+
+/// 重跑恢复提示：只读 state（A.8 同款严格只读 —— 不修复、不 reconcile，
+/// 对账留给 Ledger::open）。指纹不匹配时不提示：Ledger::open 会大声报错，
+/// 此时打印"从哪续"反而误导。格式化全部在 [`crate::progress::resume_hint`]。
+fn print_resume_hint(dest: &Path, plan: &Plan) {
+    match State::load(dest) {
+        Ok(Some(st)) if st.fingerprint == plan.fingerprint() => {
+            for line in crate::progress::resume_hint(&st).lines() {
+                eprintln!("{line}");
+            }
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => eprintln!("rgc: no readable state.json — will reconcile progress from the main repo"),
+        Err(_) => {} // 读取故障留给 Ledger::open 统一报告
+    }
 }
 
 /// 调度 + 收尾（clone/resume 共用尾部）。

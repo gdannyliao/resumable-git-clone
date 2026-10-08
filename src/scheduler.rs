@@ -18,10 +18,12 @@ use crate::errors::{kind_of, FailureKind, RgcError};
 use crate::gitio;
 use crate::ledger::Ledger;
 use crate::planner::{halve_step, next_step, Piece, Plan, StepMeasurement};
+use crate::progress::{human_bytes, human_duration, render_line, Progress};
 use crate::state::{pieces_dir, ChainState, PieceState, PieceStatus};
 use crate::throttle::Throttle;
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -149,6 +151,12 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
     let ledger = Ledger::open(main, plan)?;
     // 降速器：测试可经 SchedulerConfig::throttle 注入预布防的实例；否则自造
     let throttle = cfg.throttle.clone().unwrap_or_else(|| Throttle::new(cfg));
+    // 进度监视：每片一个在途字节槽位（worker 累加 / complete 后清零），
+    // 监视线程据此 + 台账快照合成状态行
+    let progress = Progress::new(plan.pieces.len());
+    // 监视收工信号：worker 全部 join 后置位，监视线程最迟 50ms 退出。
+    // 与 ledger/throttle 同 —— 须声明在 scope 之外（scoped 线程要求借用活到 'env）
+    let stop = AtomicBool::new(false);
     // A.15d 前提：worker 经 scope 借用 plan/main/cfg/ledger/throttle 跨线程运行
     //（SchedulerConfig 的 Send+Sync 静态断言见 tests/scheduler_parallel.rs），
     // 免去 Arc<Plan> 克隆。
@@ -157,14 +165,20 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
         // 不会搬走 Ledger/Throttle 本体
         let ledger = &ledger;
         let throttle = &throttle;
+        let progress = &progress;
+        let stop = &stop;
+        let monitor_handle = scope.spawn(move || monitor(ledger, progress, stop));
         let configured_jobs = cfg.clamped_jobs();
         let handles: Vec<_> = (0..configured_jobs)
-            .map(|worker_idx| scope.spawn(move || worker(plan, main, ledger, cfg, throttle, worker_idx)))
+            .map(|worker_idx| scope.spawn(move || worker(plan, main, ledger, cfg, throttle, progress, worker_idx)))
             .collect();
-        handles
+        let failures = handles
             .into_iter()
             .flat_map(|h| h.join().unwrap_or_else(|_| vec!["<worker panicked>".to_string()]))
-            .collect()
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        let _ = monitor_handle.join();
+        failures
     });
     // A.15a：断路器优先 —— 全局 429 超阈值时整个 run 立即放弃
     //（片停在 Running 无妨：rerun 的 load 把 Running 折返 Pending）
@@ -180,11 +194,64 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
     Ok(())
 }
 
+/// 监视线程：每秒把台账快照 + 在途字节合成一行状态写 stderr。
+/// tty：`\r` 原地刷新单行；非 tty（CI/重定向）：立即打第一行，随后每 10s
+/// 一行，不刷屏。速度口径：窗口速度取"最近一次字节变化"区间内的实测吞吐
+/// （长 fetch 步骤期间保持显示上一步实测值，绝不显示误导的 0；本轮尚未
+/// 测到任何字节时 render_line 显示 measuring…）；avg 为本轮全程平均。
+/// 刻度切片 50ms：stop 置位后最迟 50ms 收工，短 run（测试）不被秒级
+/// 刻度拖慢。监视只用真实 sleep —— cfg.sleep 是重试退避的测试缝隙，
+/// 与本线程无关。
+fn monitor(ledger: &Ledger, progress: &Progress, stop: &AtomicBool) {
+    use std::io::IsTerminal;
+    let tty = std::io::stderr().is_terminal();
+    let initial_bytes = ledger.progress_snapshot().2 + progress.in_flight_bytes();
+    let mut last_change_bytes = initial_bytes;
+    let mut last_change_at = Instant::now();
+    let mut cur: Option<f64> = None;
+    let mut last_print = Instant::now() - Duration::from_secs(10);
+    let mut tick = Duration::ZERO;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        tick += Duration::from_millis(50);
+        if tick < Duration::from_secs(1) {
+            continue;
+        }
+        tick = Duration::ZERO;
+        let (done, total, persisted) = ledger.progress_snapshot();
+        let bytes = persisted + progress.in_flight_bytes();
+        let now = Instant::now();
+        if bytes != last_change_bytes {
+            let dt = now.duration_since(last_change_at).as_secs_f64();
+            if dt > 0.0 {
+                cur = Some((bytes - last_change_bytes) as f64 / dt);
+            }
+            last_change_bytes = bytes;
+            last_change_at = now;
+        }
+        let elapsed = progress.elapsed();
+        let avg = if elapsed > 0.0 { bytes.saturating_sub(initial_bytes) as f64 / elapsed } else { 0.0 };
+        let line = render_line(done, total, bytes, cur, avg);
+        if tty {
+            eprint!("\r\x1b[K{line}");
+        } else if last_print.elapsed() >= Duration::from_secs(10) {
+            eprintln!("{line}");
+            last_print = now;
+        }
+    }
+    if tty {
+        eprintln!(); // \r 行收尾换行，不污染后续输出
+    }
+}
+
 /// 并行工作循环（A.15）：认领 → 执行 → 记账，直至无 Pending 片或断路器触发。
 /// 单片失败不中止整个 run（否则"最后统一列出失败片"就是死代码）：
 /// GiveUp 片落终态 Failed，逐片失败明细随 worker 返回，run 结束统一报告；
 /// rerun 由 Ledger::open 折返重试。断路器触发则立即收工，由 run() 统一报告。
-fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, throttle: &Throttle, worker_idx: usize) -> Vec<String> {
+fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, throttle: &Throttle, progress: &Progress, worker_idx: usize) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     loop {
         if throttle.tripped() {
@@ -216,7 +283,7 @@ fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, thro
             break;
         };
         let id = claim.ps.id.clone();
-        if let Err(e) = execute_piece(plan, main, ledger, claim, cfg, throttle) {
+        if let Err(e) = execute_piece(plan, main, ledger, claim, cfg, throttle, progress) {
             // A.15a：全局放弃优先于逐片失败报告
             if throttle.tripped() {
                 break;
@@ -228,10 +295,20 @@ fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, thro
     failures
 }
 
+/// 片执行上下文：run_piece/run_chain/run_tags 共享的只读环境
+///（打包传递，避免逐层散传 5 个相同参数）。
+struct PieceCtx<'a> {
+    plan: &'a Plan,
+    main: &'a Path,
+    cfg: &'a SchedulerConfig,
+    throttle: &'a Throttle,
+    progress: &'a Progress,
+}
+
 /// 片执行（A.15c）：磁盘预检后执行认领来的配对 entry（身份 + 进度），
 /// 完成时整体回写落盘；片执行本身（可能数分钟）完全不持锁 —— 其他
 /// worker 的认领/落盘不受阻塞。
-fn execute_piece(plan: &Plan, main: &Path, ledger: &Ledger, claim: crate::ledger::Claim, cfg: &SchedulerConfig, throttle: &Throttle) -> Result<()> {
+fn execute_piece(plan: &Plan, main: &Path, ledger: &Ledger, claim: crate::ledger::Claim, cfg: &SchedulerConfig, throttle: &Throttle, progress: &Progress) -> Result<()> {
     let crate::ledger::Claim { idx, piece, mut ps } = claim;
     // 磁盘预检：按历史最大片字节 × 1.5 估算
     let max_seen = ledger.max_piece_bytes();
@@ -244,8 +321,18 @@ fn execute_piece(plan: &Plan, main: &Path, ledger: &Ledger, claim: crate::ledger
         }
     }
     let piece_path: PathBuf = pieces_dir(main).join(piece.piece_dir_name());
-    let res = run_piece(&piece, plan, main, &piece_path, &mut ps, cfg, throttle);
+    let ctx = PieceCtx { plan, main, cfg, throttle, progress };
+    let started = Instant::now();
+    let res = run_piece(idx, &piece, &piece_path, &mut ps, &ctx);
+    let id = ps.id.clone();
+    let bytes = ps.bytes;
     ledger.complete(idx, ps)?;
+    // 字节已随 complete 并入台账落盘 —— 清零在途槽位，监视口径不重复计数
+    progress.clear(idx);
+    if res.is_ok() {
+        let (done, total, _) = ledger.progress_snapshot();
+        eprintln!("rgc: piece {done}/{total} done: {id} (+{} in {})", human_bytes(bytes), human_duration(started.elapsed().as_secs_f64()));
+    }
     // 全局冷却布防在 run_piece 内逐次进行（限流/拥塞的每次出现，spec §4.4，
     // 经 Throttle::on_failure）
     res
@@ -257,7 +344,9 @@ fn execute_piece(plan: &Plan, main: &Path, ledger: &Ledger, claim: crate::ledger
 /// 连续限流次数独立记账（非限流失败即复位），超过 max_rate_limits 才放弃。
 /// run 级降速信号（冷却布防 / 总 429 计数 / 断路器 / 并发减半）全部经
 /// `throttle.on_failure` 上报，由 Throttle 独占（A.15a 语义不变）。
-fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mut PieceState, cfg: &SchedulerConfig, throttle: &Throttle) -> Result<()> {
+fn run_piece(idx: usize, piece: &Piece, piece_path: &Path, ps: &mut PieceState, ctx: &PieceCtx) -> Result<()> {
+    let cfg = ctx.cfg;
+    let throttle = ctx.throttle;
     loop {
         // A.15a：断路器已触发 → 立即止损（退避睡眠醒来后第一时间退出）
         if throttle.tripped() {
@@ -267,9 +356,9 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
             Piece::Chain { .. } => {
                 // 链状态由 Ledger::claim 保证（认领时补全），此处不再防御性兜底
                 let chain = ps.chain.clone().expect("Ledger::claim guarantees chain state for chain pieces");
-                run_chain(piece, plan, main, ps, chain, cfg, throttle)
+                run_chain(idx, piece, ps, chain, ctx)
             }
-            Piece::TagBatch { tags } => run_tags(plan, main, piece_path, tags, ps, cfg),
+            Piece::TagBatch { tags } => run_tags(idx, piece_path, tags, ps, ctx),
         };
         match res {
             Ok(()) => {
@@ -343,7 +432,8 @@ fn run_piece(piece: &Piece, plan: &Plan, main: &Path, piece_path: &Path, ps: &mu
 /// 附录 A.6：git 禁止从浅仓搬运（shallow roots 禁更新，exit 0 静默）——
 /// 只在链完成后调用一次 transport_to_main(final_dst=true)，中途不做 wip 搬运
 /// （plan 正文"每步立即搬运"的注释作废；B1 断言在 transport_to_main 内，A.9）。
-fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain: ChainState, cfg: &SchedulerConfig, throttle: &Throttle) -> Result<()> {
+fn run_chain(idx: usize, piece: &Piece, ps: &mut PieceState, chain: ChainState, ctx: &PieceCtx) -> Result<()> {
+    let (plan, main, cfg, throttle, progress) = (ctx.plan, ctx.main, ctx.cfg, ctx.throttle, ctx.progress);
     let Piece::Chain { full_ref, short_name: short } = piece else {
         bail!("run_chain on non-chain piece {}", piece.id());
     };
@@ -383,6 +473,8 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
         depth_done = c1;
         let added_bytes = b1.saturating_sub(b0);
         ps.bytes += added_bytes;
+        // 在途字节：监视线程的实时总量 = 台账已落盘 + 各片在途（complete 后清零）
+        progress.add(idx, added_bytes);
         // 记账在分诊之前：run_piece 的重试动作（减半/退化）都从最新状态出发
         ps.chain = Some(ChainState { depth_done, step, no_shallow: chain.no_shallow });
         let complete = !gitio::is_shallow(&piece_path);
@@ -406,7 +498,8 @@ fn run_chain(piece: &Piece, plan: &Plan, main: &Path, ps: &mut PieceState, chain
 
 /// tag 批片：一次连接按钉住 OID fetch，再原子搬运进主仓库正式 refs/tags/*。
 /// tag fetch 永不加 --depth（片绝不能浅，A.6），故无需浅边界检查。
-fn run_tags(plan: &Plan, main: &Path, piece_path: &Path, tags: &[crate::refs::RefEntry], ps: &mut PieceState, cfg: &SchedulerConfig) -> Result<()> {
+fn run_tags(idx: usize, piece_path: &Path, tags: &[crate::refs::RefEntry], ps: &mut PieceState, ctx: &PieceCtx) -> Result<()> {
+    let (plan, main, cfg, progress) = (ctx.plan, ctx.main, ctx.cfg, ctx.progress);
     gitio::ensure_piece_repo(main, piece_path, &plan.url)?;
     let (b0, _) = gitio::repo_stats(piece_path, "")?;
     // TODO(A.11): 远端漂移导致 tag 批 "not our ref" / "couldn't find remote ref"
@@ -417,6 +510,7 @@ fn run_tags(plan: &Plan, main: &Path, piece_path: &Path, tags: &[crate::refs::Re
     (cfg.fetch)(&real)?;
     let (b1, _) = gitio::repo_stats(piece_path, "")?;
     ps.bytes += b1.saturating_sub(b0);
+    progress.add(idx, b1.saturating_sub(b0));
     gitio::transport_tags_to_main(main, piece_path, tags)?;
     Ok(())
 }

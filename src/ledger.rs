@@ -114,6 +114,14 @@ impl Ledger {
             .unwrap_or(0)
     }
 
+    /// 监视线程的单次锁内快照：(已完成片数, 总片数, 台账已落盘字节)。
+    /// 在途字节不归台账管（见 [`crate::progress::Progress`]），调用方自行相加。
+    pub fn progress_snapshot(&self) -> (usize, usize, u64) {
+        let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let done = g.pieces.iter().filter(|p| p.status == PieceStatus::Done).count();
+        (done, g.pieces.len(), g.pieces.iter().map(|p| p.bytes).sum())
+    }
+
     /// run 收尾报告：所有非 Done 片的 id。
     pub fn unfinished_ids(&self) -> Vec<String> {
         self.state
@@ -282,6 +290,21 @@ mod tests {
         assert!(ledger.claim(&plan, 5).unwrap().is_some());
         assert!(ledger.claim(&plan, 5).unwrap().is_none(), "no Pending left");
         assert!(!ledger.has_pending());
+    }
+
+    #[test]
+    fn progress_snapshot_counts_done_and_bytes() {
+        let td = tempfile::tempdir().unwrap();
+        let main = td.path().join("repo");
+        init_main(&main);
+        let plan = sample_plan();
+        let mut st = State::new(&plan);
+        st.pieces[0].status = PieceStatus::Done;
+        st.pieces[0].bytes = 4096;
+        st.pieces[1].bytes = 100; // 中途片的字节也计入已下载总量
+        plant_state(&main, &st);
+        let ledger = Ledger::open(&main, &plan).unwrap();
+        assert_eq!(ledger.progress_snapshot(), (1, 2, 4196));
     }
 
     #[test]
