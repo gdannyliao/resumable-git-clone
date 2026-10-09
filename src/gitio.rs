@@ -209,6 +209,14 @@ pub fn repo_stats(repo: &Path, short: &str) -> Result<(u64, u32)> {
     Ok((dir_size(&repo.join(".git")), commits))
 }
 
+/// 仓库对象库当前字节数（不含提交计数、不起子进程）—— 与 [`repo_stats`] 同口径，
+/// 供进度监视线程每秒采样：git 边收边写 pack 临时文件，故这个值在单个长的
+/// fetch 步进行期间就持续增长，是唯一能给出实时字节/速度的来源。
+/// 路径不存在（片尚未创建）→ 0。
+pub fn repo_bytes(repo: &Path) -> u64 {
+    dir_size(&repo.join(".git"))
+}
+
 /// 链式片执行一步。三种模式：
 /// - no_shallow：服务端不支持 shallow 时的退化，整支 fetch；
 /// - 已有本地分支且仍 shallow：--deepen=<step>；

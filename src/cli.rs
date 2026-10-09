@@ -12,7 +12,7 @@
 //! 与计划正文的偏差：正文 clone_existing 自行 load/reconcile，现 API（A.16c）由
 //! `scheduler::run` 内部持有 `Arc<Mutex<State>>` 完成 load/指纹守卫/reconcile，
 //! 流程层只调 run()；运行期进度/速度由调度器内的监视线程呈现
-//! （台账快照 + 在途字节，见 [`crate::progress`]），重跑恢复点由
+//! （每秒采样片仓库目录得出实时字节，见 [`crate::progress`]），重跑恢复点由
 //! `print_resume_hint` 只读 state 报告。
 
 use crate::finalizer;

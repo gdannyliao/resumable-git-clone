@@ -3,9 +3,6 @@
 //! 恢复提示（重跑时报告从哪续）。全部为纯函数/小结构体，
 //! 调度器与 cli 的接线处不做任何格式化逻辑（便于单测）。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
-
 const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
 /// 人类可读字节数：二进制单位；<100 保留一位小数，>=100 取整。
@@ -45,13 +42,15 @@ pub fn human_duration(secs: f64) -> String {
 }
 
 /// 渲染一行监视状态：
-/// `rgc: 3/10 pieces done, 1.2 GiB, 5.4 MiB/s (avg 4.0 MiB/s)`
-/// cur=None（本轮尚未测到任何字节）→ `measuring…` 占位，绝不显示误导的 0。
-pub fn render_line(done: usize, total: usize, bytes: u64, cur: Option<f64>, avg: f64) -> String {
+/// `rgc: 3/10 pieces done, 1.2 GiB, 5.4 MiB/s (avg 4.0 MiB/s, 2m14s elapsed)`
+/// cur=None（本轮尚未测到任何字节）→ `measuring…` 占位，绝不显示误导的 0；
+/// 末尾恒带已用时长 —— "measuring…" 期间用户能看出到底等了多久。
+pub fn render_line(done: usize, total: usize, bytes: u64, cur: Option<f64>, avg: f64, elapsed_secs: f64) -> String {
+    let elapsed = human_duration(elapsed_secs);
     match cur {
-        None => format!("rgc: {done}/{total} pieces done, {}, measuring…", human_bytes(bytes)),
+        None => format!("rgc: {done}/{total} pieces done, {}, measuring… ({elapsed} elapsed)", human_bytes(bytes)),
         Some(c) => format!(
-            "rgc: {done}/{total} pieces done, {}, {} (avg {})",
+            "rgc: {done}/{total} pieces done, {}, {} (avg {}, {elapsed} elapsed)",
             human_bytes(bytes),
             human_speed(c),
             human_speed(avg)
@@ -111,37 +110,46 @@ pub fn remote_summary(remote: &crate::refs::RemoteRefs, pieces: usize) -> String
     )
 }
 
-/// 跨 worker 共享的运行期进度：每片一个"在途字节"槽位 —— worker 每完成
-/// 一步 fetch 累加，`Ledger::complete` 落盘后清零（字节已并入台账持久计数，
-/// 清零避免与台账重复计数）。监视线程据此算出"已下载总量"的实时值。
-pub struct Progress {
-    started: Instant,
-    in_flight: Vec<AtomicU64>,
+/// 目录增长累计器：把"片仓库 .git 当前字节数"的每秒采样折算成本轮下载量。
+///
+/// 为什么需要它：一次 fetch 步（如首片 `--depth=10000`）可能连拉数百 MiB、
+/// 耗时数分钟，期间台账只在步结束时更新一次 —— 只读台账的话字节与速度会
+/// 长时间停在 0（只剩 `measuring…`）。而 git 边收边写片仓库的 pack 临时文件，
+/// 其 .git 大小逐秒增长（实测：4s 起增长、35s 到 98 MiB），采样即可给出实时
+/// 字节与速度。
+///
+/// 只加不减：片仓库损坏重建导致的回缩只重设基线（否则总量倒退会被误读成
+/// "负下载"）；越界槽位忽略（片数变化的历史现场，绝不 panic）。
+pub struct ByteTracker {
+    last: Vec<u64>,
+    total: u64,
 }
 
-impl Progress {
-    pub fn new(pieces: usize) -> Progress {
-        Progress { started: Instant::now(), in_flight: (0..pieces).map(|_| AtomicU64::new(0)).collect() }
+impl ByteTracker {
+    pub fn new(pieces: usize) -> ByteTracker {
+        ByteTracker { last: vec![0; pieces], total: 0 }
     }
 
-    pub fn add(&self, idx: usize, bytes: u64) {
-        if let Some(slot) = self.in_flight.get(idx) {
-            slot.fetch_add(bytes, Ordering::Relaxed);
+    /// 设定基线：已有内容（resume 的历史下载）不计入本轮增量。
+    pub fn seed(&mut self, idx: usize, size: u64) {
+        if let Some(slot) = self.last.get_mut(idx) {
+            *slot = size;
         }
     }
 
-    pub fn clear(&self, idx: usize) {
-        if let Some(slot) = self.in_flight.get(idx) {
-            slot.store(0, Ordering::Relaxed);
+    /// 采样一次：相对上次的增加量计入总量；回缩只更新基线。
+    pub fn observe(&mut self, idx: usize, size: u64) {
+        let Some(slot) = self.last.get_mut(idx) else {
+            return;
+        };
+        if size > *slot {
+            self.total += size - *slot;
         }
+        *slot = size;
     }
 
-    pub fn in_flight_bytes(&self) -> u64 {
-        self.in_flight.iter().map(|s| s.load(Ordering::Relaxed)).sum()
-    }
-
-    pub fn elapsed(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
+    pub fn total(&self) -> u64 {
+        self.total
     }
 }
 
@@ -181,12 +189,12 @@ mod tests {
     #[test]
     fn render_line_with_and_without_measurement() {
         assert_eq!(
-            render_line(0, 10, 0, None, 0.0),
-            "rgc: 0/10 pieces done, 0 B, measuring…"
+            render_line(0, 10, 0, None, 0.0, 75.0),
+            "rgc: 0/10 pieces done, 0 B, measuring… (1m15s elapsed)"
         );
         assert_eq!(
-            render_line(3, 10, 1_288_490_188, Some(5_662_310.4), 4_194_304.0),
-            "rgc: 3/10 pieces done, 1.2 GiB, 5.4 MiB/s (avg 4.0 MiB/s)"
+            render_line(3, 10, 1_288_490_188, Some(5_662_310.4), 4_194_304.0, 134.0),
+            "rgc: 3/10 pieces done, 1.2 GiB, 5.4 MiB/s (avg 4.0 MiB/s, 2m14s elapsed)"
         );
     }
 
@@ -275,16 +283,33 @@ mod tests {
         assert_eq!(remote_summary(&remote(1, 0), 1), "rgc: remote: 1 branch, 0 tags → 1 piece");
     }
 
+    /// 长的单步 fetch（一次 --deepen 可拉数百 MiB）期间台账不更新 —— 字节/速度
+    /// 只能靠"片仓库 .git 实际大小"的每秒采样。累计器只加不减（片仓库被重建时
+    /// 回缩只重设基线，否则总量会倒退），seed 用于 resume 时把已有内容排除在
+    /// 本轮增量之外。
     #[test]
-    fn progress_in_flight_accounting() {
-        let p = Progress::new(3);
-        assert_eq!(p.in_flight_bytes(), 0);
-        p.add(1, 100);
-        p.add(1, 50);
-        p.add(2, 7);
-        assert_eq!(p.in_flight_bytes(), 157);
-        p.clear(1);
-        assert_eq!(p.in_flight_bytes(), 7);
-        assert!(p.elapsed() >= 0.0);
+    fn byte_tracker_counts_growth_monotonically() {
+        let mut t = ByteTracker::new(3);
+        t.seed(0, 100); // 基线：已有内容不计入本轮
+        t.seed(1, 0);
+        t.seed(2, 0);
+        assert_eq!(t.total(), 0);
+        t.observe(0, 250);
+        assert_eq!(t.total(), 150);
+        t.observe(1, 40);
+        assert_eq!(t.total(), 190);
+        t.observe(0, 200); // 回缩（片仓库损坏重建）：只更新基线，总量不倒退
+        assert_eq!(t.total(), 190);
+        t.observe(0, 260);
+        assert_eq!(t.total(), 250);
+        t.observe(1, 40); // 无变化：不得重复计数
+        assert_eq!(t.total(), 250);
+    }
+
+    #[test]
+    fn byte_tracker_ignores_out_of_range_slot() {
+        let mut t = ByteTracker::new(1);
+        t.observe(9, 1_000); // 防御越界（片数变化的历史现场）
+        assert_eq!(t.total(), 0);
     }
 }

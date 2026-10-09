@@ -115,7 +115,8 @@ impl Ledger {
     }
 
     /// 监视线程的单次锁内快照：(已完成片数, 总片数, 台账已落盘字节)。
-    /// 在途字节不归台账管（见 [`crate::progress::Progress`]），调用方自行相加。
+    /// 字节只作起跑基线用（resume 时已有内容不计入本轮增量）—— 步内的实时
+    /// 字节由监视线程采样片仓库目录得出，见 [`crate::progress::ByteTracker`]。
     pub fn progress_snapshot(&self) -> (usize, usize, u64) {
         let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let done = g.pieces.iter().filter(|p| p.status == PieceStatus::Done).count();
