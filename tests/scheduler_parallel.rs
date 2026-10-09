@@ -126,6 +126,52 @@ fn rate_limit_storm_bails_run() {
     );
 }
 
+/// 引导闸门（去重）：全新 clone 时主仓库没有任何 refs，片仓库无从 --shared 借
+/// 对象。修复前 jobs=2 让首片与第二个片同时起步，两者都把重叠历史完整下一遍
+/// （实测 deepseek-harness：276 MiB 的仓库共传 552 MiB）；且 git fetch 把对象
+/// 写进本片仓库、alternates 只是只读视图，事后补 alternates 追不回已下的字节。
+/// 修复后第二个片必须等首片把基底搬进主仓库，因而经 --shared 起步 ——
+/// 判据就是它片仓库里出现 objects/info/alternates。
+#[test]
+fn bootstrap_gate_makes_later_pieces_share_objects() {
+    let origin = build_origin(40, &[], &[("v1", 20)]);
+    let url = origin.to_str().unwrap();
+    let td = tempfile::tempdir().unwrap();
+    let main = td.path().join("repo");
+    let plan = build_plan(url, &ls_remote(url).unwrap(), &PlannerConfig { initial_step: 20, ..Default::default() }).unwrap();
+    assert_eq!(plan.pieces.len(), 2, "fixture: 1 chain + 1 tag batch");
+    run(&plan, &main, &SchedulerConfig { jobs: 2, ..Default::default() }).unwrap();
+    let st = State::load(&main).unwrap().unwrap();
+    assert!(st.pieces.iter().all(|p| p.status == PieceStatus::Done), "got {:?}", st.pieces);
+
+    let alternates = |idx: usize| {
+        rgc::state::pieces_dir(&main).join(plan.pieces[idx].piece_dir_name()).join(".git/objects/info/alternates")
+    };
+    assert!(
+        !alternates(0).exists(),
+        "引导片在主仓库还没有 refs 时起步，本就无从共享 —— 它不该有 alternates"
+    );
+    assert!(
+        alternates(1).exists(),
+        "引导片落地后，第二个片必须 --shared 借主仓库对象，否则重叠历史被重复下载"
+    );
+    // 字节级判据（只看 alternates 文件不够 —— 要证明确实只付了增量）：tags 片真正
+    // 缺的只有 tag 对象本身，其历史经 alternates 已在本地。修复前同一 fixture 实测
+    // tags 片 6.7 KiB vs 首片 14.4 KiB（几乎整份重复），故 4× 余量足以区分。
+    let bytes_of = |prefix: &str| {
+        st.pieces
+            .iter()
+            .find(|p| p.id.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} piece in {st:?}"))
+            .bytes
+    };
+    let (chain_bytes, tag_bytes) = (bytes_of("chain:"), bytes_of("tags:"));
+    assert!(
+        tag_bytes * 4 < chain_bytes,
+        "tags 片必须只付增量（tag 对象），不得重下首片已有历史：tags {tag_bytes} B vs chain {chain_bytes} B"
+    );
+}
+
 /// 真并行证明：fetch 钩子自带 500ms 真睡并统计并发峰值 —— jobs=3 时峰值必须 >1
 /// （串行执行峰值恒为 1）；500ms 窗口给 CI 线程启动抖动留足余量。
 #[test]

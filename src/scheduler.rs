@@ -24,7 +24,7 @@ use crate::throttle::Throttle;
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 // —— 测试缝隙（附录 A.14 / Task 12 审查 I2）——
@@ -151,6 +151,10 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
     let ledger = Ledger::open(main, plan)?;
     // 降速器：测试可经 SchedulerConfig::throttle 注入预布防的实例；否则自造
     let throttle = cfg.throttle.clone().unwrap_or_else(|| Throttle::new(cfg));
+    // 引导闸门：主仓库已有 refs 的（resume/对账后）闸门常开，保持既有并行；
+    // 全新 clone 则先只放行一个片去建立共享基底，其余片等它落地再 --shared 去重。
+    // 时序：在 Ledger::open 之后问 —— 对账的破坏性 wipe 可能改变主仓库 refs。
+    let gate = BootstrapGate::new(!gitio::main_has_refs(main));
     // 进度监视的采样目标：各片仓库路径（按 plan 顺序，与台账槽位一一对应）。
     // 字节不取自台账（步结束才更新），而是每秒采样这些仓库的 .git 实际大小。
     let piece_repos: Vec<PathBuf> =
@@ -166,12 +170,13 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
         // 不会搬走 Ledger/Throttle 本体
         let ledger = &ledger;
         let throttle = &throttle;
+        let gate = &gate;
         let piece_repos = &piece_repos;
         let stop = &stop;
         let monitor_handle = scope.spawn(move || monitor(ledger, piece_repos, stop));
         let configured_jobs = cfg.clamped_jobs();
         let handles: Vec<_> = (0..configured_jobs)
-            .map(|worker_idx| scope.spawn(move || worker(plan, main, ledger, cfg, throttle, worker_idx)))
+            .map(|worker_idx| scope.spawn(move || worker(plan, main, ledger, cfg, throttle, gate, worker_idx)))
             .collect();
         let failures = handles
             .into_iter()
@@ -193,6 +198,97 @@ pub fn run(plan: &Plan, main: &Path, cfg: &SchedulerConfig) -> Result<()> {
         bail!("pieces failed permanently: {:?} — rerun to resume. {}", failed, failures.join(" | "));
     }
     Ok(())
+}
+
+/// 引导闸门：全新 clone 时主仓库没有任何 refs，片仓库无从 `--shared` 借对象 ——
+/// 此时若多个片并发起步，各自都会把重叠历史完整下一遍（多分支的公共主干、
+/// tags 指向的同一段历史；实测 276 MiB 的仓库共传 552 MiB）。而 git fetch 把
+/// 收到的对象写进**本片仓库**、`objects/info/alternates` 只是对另一个对象库的
+/// 只读视图 —— 事后补 alternates 追不回已经下过的字节，故唯一有效的做法是：
+/// 共享基底（主仓库 refs）存在之前只放行一个片。
+///
+/// 释放条件（fail-open，绝不卡死）：引导片结束（成功/失败/断路器都算）。
+/// 主仓库本就已有 refs 的仓库（resume）以"已释放"状态构造，行为与修复前一致。
+struct BootstrapGate {
+    inner: Mutex<BootstrapInner>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct BootstrapInner {
+    /// 引导权已被某 worker 取得 —— 保证同时只有一个片在跑
+    claimed: bool,
+    released: bool,
+}
+
+/// 引导闸门的裁决：谁去建立共享基底。
+enum BootstrapTurn {
+    /// 本 worker 取得引导权 —— 必须在首个片结束后 drop 守卫释放闸门
+    Bootstrap,
+    /// 闸门已释放（主仓库本就有 refs，或引导片已结束）→ 照常认领
+    Released,
+    /// 等待期间出现中止条件（断路器触发 / 已无待办片）
+    Cancelled,
+}
+
+impl BootstrapGate {
+    /// needed=false：主仓库已有 refs（resume）→ 闸门常开，不改变既有行为
+    fn new(needed: bool) -> BootstrapGate {
+        BootstrapGate {
+            inner: Mutex::new(BootstrapInner { claimed: !needed, released: !needed }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// 取引导权或等闸门释放。等待用 Condvar（200ms 超时轮询取消条件）：
+    /// 不用 `cfg.sleep` —— 那是退避/冷却的测试缝隙，且测试注入的 no-op 钩子
+    /// 在此会变成空转热循环。
+    fn acquire_or_wait(&self, cancelled: &dyn Fn() -> bool) -> BootstrapTurn {
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if g.released {
+                return BootstrapTurn::Released;
+            }
+            if !g.claimed {
+                g.claimed = true;
+                return BootstrapTurn::Bootstrap;
+            }
+        }
+        // 已有引导者在建立共享基底：提示一次，免得其余 worker 静默待命看起来像卡住。
+        // 放锁之后再打印 —— 不在持锁期间做 I/O。
+        eprintln!("rgc: waiting for the first piece to land — later pieces then start --shared and skip re-downloading its objects");
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if g.released {
+                return BootstrapTurn::Released;
+            }
+            if cancelled() {
+                return BootstrapTurn::Cancelled;
+            }
+            let (next, _) = self.cv.wait_timeout(g, Duration::from_millis(200)).unwrap_or_else(|p| p.into_inner());
+            g = next;
+        }
+    }
+
+    fn release(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.released = true;
+        self.cv.notify_all();
+    }
+
+    fn is_released(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).released
+    }
+}
+
+/// 引导权守卫：引导片一结束（成功 / 失败 / panic 展开都算）即释放闸门 ——
+/// fail-open，其余 worker 绝不因引导者异常而永久等待。
+struct BootstrapGuard<'a>(&'a BootstrapGate);
+
+impl Drop for BootstrapGuard<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 /// 监视线程：每秒采样各片仓库 .git 的实际大小（[`ByteTracker`]），叠加起跑
@@ -267,7 +363,7 @@ fn monitor(ledger: &Ledger, piece_repos: &[PathBuf], stop: &AtomicBool) {
 /// 单片失败不中止整个 run（否则"最后统一列出失败片"就是死代码）：
 /// GiveUp 片落终态 Failed，逐片失败明细随 worker 返回，run 结束统一报告；
 /// rerun 由 Ledger::open 折返重试。断路器触发则立即收工，由 run() 统一报告。
-fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, throttle: &Throttle, worker_idx: usize) -> Vec<String> {
+fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, throttle: &Throttle, gate: &BootstrapGate, worker_idx: usize) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     loop {
         if throttle.tripped() {
@@ -279,6 +375,18 @@ fn worker(plan: &Plan, main: &Path, ledger: &Ledger, cfg: &SchedulerConfig, thro
         if !ledger.has_pending() {
             break;
         }
+        // 引导闸门（见 BootstrapGate）：共享基底存在前只放行一个片。守卫在本次
+        // 迭代结束时 drop —— 引导片一结束（成功/失败/panic 展开）即放行其余 worker。
+        // 闸门常开后（已释放）不再走闸门路径：省一次加锁，后续认领零开销。
+        let _bootstrap = if gate.is_released() {
+            None
+        } else {
+            match gate.acquire_or_wait(&|| throttle.tripped() || !ledger.has_pending()) {
+                BootstrapTurn::Bootstrap => Some(BootstrapGuard(gate)),
+                BootstrapTurn::Released => None,
+                BootstrapTurn::Cancelled => break,
+            }
+        };
         // 认领前的统一等待：全局冷却（循环重读 + 每 worker 抖动，spec §4.4/A.15b）
         // + 并发减半闸门（A.15a；Pending 清空即放行被闸 worker，A.17）——
         // 全部归 Throttle；台账探测以闭包注入，Throttle 保持台账无关。
@@ -535,6 +643,60 @@ mod tests {
         assert_eq!(backoff_secs(1), 4);
         assert_eq!(backoff_secs(2), 8);
         assert_eq!(backoff_secs(10), 60);
+    }
+
+    /// 引导闸门：同一时刻只放行一个片 —— 第一个取权者成为引导者，其余必须等；
+    /// 释放后所有 worker 照常认领（恢复满并发）。
+    #[test]
+    fn bootstrap_gate_serializes_until_released() {
+        let gate = BootstrapGate::new(true);
+        assert!(matches!(gate.acquire_or_wait(&|| false), BootstrapTurn::Bootstrap), "第一个 worker 必须拿到引导权");
+        assert!(matches!(gate.acquire_or_wait(&|| true), BootstrapTurn::Cancelled), "引导者未结束前，其余 worker 只能被取消条件放行");
+        assert!(!gate.is_released());
+        gate.release();
+        assert!(gate.is_released());
+        assert!(matches!(gate.acquire_or_wait(&|| false), BootstrapTurn::Released), "释放后不再有人去引导");
+    }
+
+    /// resume：主仓库已有 refs 时闸门常开，行为与修复前一致（不牺牲并行）。
+    #[test]
+    fn bootstrap_gate_is_open_when_main_already_has_refs() {
+        let gate = BootstrapGate::new(false);
+        assert!(matches!(gate.acquire_or_wait(&|| false), BootstrapTurn::Released));
+        assert!(matches!(gate.acquire_or_wait(&|| false), BootstrapTurn::Released));
+    }
+
+    /// 等待中的 worker 若遇到中止条件（断路器触发 / 待办清空）必须立即返回，
+    /// 否则 run() 在 join 处挂死。
+    #[test]
+    fn bootstrap_gate_waiter_honours_cancel() {
+        let gate = BootstrapGate::new(true);
+        assert!(matches!(gate.acquire_or_wait(&|| false), BootstrapTurn::Bootstrap));
+        let cancelled = AtomicBool::new(false);
+        let handle = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // 200ms 轮询窗口内翻起取消条件：等待者必须醒来自行收工
+                std::thread::sleep(Duration::from_millis(50));
+                cancelled.store(true, Ordering::Relaxed);
+                gate.acquire_or_wait(&|| cancelled.load(Ordering::Relaxed))
+            })
+            .join()
+            .unwrap()
+        });
+        assert!(matches!(handle, BootstrapTurn::Cancelled));
+    }
+
+    /// 守卫的 Drop 即释放：引导片结束（正常/失败）放行其余 worker；
+    /// Drop 同样覆盖 panic 展开 —— 否则其余 worker 永久等待。
+    #[test]
+    fn bootstrap_guard_releases_on_drop() {
+        let gate = BootstrapGate::new(true);
+        assert!(matches!(gate.acquire_or_wait(&|| false), BootstrapTurn::Bootstrap));
+        {
+            let _guard = BootstrapGuard(&gate);
+            assert!(!gate.is_released());
+        }
+        assert!(gate.is_released(), "引导片结束后必须放行其余 worker");
     }
 
     #[test]

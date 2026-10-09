@@ -54,7 +54,9 @@ rgc status my-dir
 2. **State**：`dest/.rgc/state.json` write-ahead——先落盘 Running 再执行，成功/失败都
    回写；进程被杀后 Running 折返 Pending 重做。每片在独立片仓库 fetch（`--shared`
    借用主仓库对象），完成后才搬运进主仓库。
-3. **Scheduler**：N 个 worker 认领片；网络错误按类分诊——限流（429）**不计入片的重试
+3. **Scheduler**：N 个 worker 认领片；**全新 clone 时先只跑一个片**——主仓库还没有
+   refs 时片仓库无从 `--shared` 借对象，并发起步会把公共主干/重叠历史重复下载一遍，
+   首片落地后其余片才并行起步（引导闸门）；网络错误按类分诊——限流（429）**不计入片的重试
    预算**（独立连续计数 + 全局冷却 + run 级断路器），网络错误指数退避，致命错误立即
    终止并保留现场。
 4. **Finalize**：catch-up fetch 收敛 ls-remote 之后的漂移（强移 tag / 删 tag / 新分支），

@@ -62,7 +62,10 @@ rgc status my-dir
    Running folds back to Pending for a redo. Each piece fetches in its own piece
    repo (`--shared` borrows the main repo's objects) and is only transported into
    the main repo once complete.
-3. **Scheduler**: N workers claim pieces; network errors are triaged by class —
+3. **Scheduler**: N workers claim pieces; **a fresh clone starts with only one piece** —
+   with no refs in the main repo yet, piece repos have nothing to `--shared`, so starting
+   them concurrently re-downloads the shared trunk/history; the rest start in parallel once
+   the first piece has landed (bootstrap gate). Network errors are triaged by class —
    throttling (429) **does not consume the piece's retry budget** (separate
    consecutive counter + global cooldown + run-level circuit breaker), network
    errors back off exponentially, and fatal errors terminate immediately while
